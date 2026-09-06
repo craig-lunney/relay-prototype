@@ -103,9 +103,17 @@ def test_exceeding_max_attempts_raises(tmp_db, audit, policy, sample_task, tmp_p
 # ── Timeout handling ──────────────────────────────────────────────────────────
 
 def _make_timeout_popen(*args, **kwargs):
-    """Popen mock that always times out."""
+    """Popen mock that times out on first communicate() then returns empty on second."""
     proc = MagicMock()
-    proc.communicate.side_effect = subprocess.TimeoutExpired(args[0] if args else "cmd", 1)
+    call_count = [0]
+
+    def communicate(timeout=None):
+        call_count[0] += 1
+        if call_count[0] == 1:
+            raise subprocess.TimeoutExpired(args[0] if args else "cmd", timeout or 1)
+        return ("", "")  # called after proc.kill()
+
+    proc.communicate.side_effect = communicate
     proc.returncode = -1
     return proc
 
@@ -149,12 +157,16 @@ def test_timeout_ceiling_enforced(tmp_db, audit, policy, sample_task, tmp_path):
     engine = _make_engine(tmp_db, audit, policy)
 
     captured_timeout = []
+    call_tracker = [0]
 
     def mock_popen(*args, **kwargs):
         proc = MagicMock()
         def communicate(timeout=None):
-            captured_timeout.append(timeout)
-            raise subprocess.TimeoutExpired("cmd", timeout)
+            call_tracker[0] += 1
+            if call_tracker[0] == 1:
+                captured_timeout.append(timeout)
+                raise subprocess.TimeoutExpired("cmd", timeout)
+            return ("", "")
         proc.communicate.side_effect = communicate
         return proc
 

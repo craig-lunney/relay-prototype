@@ -67,12 +67,12 @@ def test_verifier_detects_branch(test_repo):
 def test_verifier_detects_modified_file(test_repo):
     # Apply the fix to calculator.py
     calc = test_repo / "calculator.py"
-    content = calc.read_text()
+    content = calc.read_text(encoding="utf-8")
     fixed = content.replace(
         "discount_amount = price * discount_percent // 100",
         "discount_amount = price * discount_percent / 100",
     )
-    calc.write_text(fixed)
+    calc.write_text(fixed, encoding="utf-8")
 
     verifier = Verifier()
     task = _make_task(str(test_repo))
@@ -112,12 +112,12 @@ def test_verifier_runs_tests_and_captures_exit_code(test_repo):
 def test_verifier_passes_after_fix(test_repo):
     """After the fix is applied, verifier should report tests passing."""
     calc = test_repo / "calculator.py"
-    content = calc.read_text()
+    content = calc.read_text(encoding="utf-8")
     fixed = content.replace(
         "discount_amount = price * discount_percent // 100",
         "discount_amount = price * discount_percent / 100",
     )
-    calc.write_text(fixed)
+    calc.write_text(fixed, encoding="utf-8")
 
     verifier = Verifier()
     task = _make_task(str(test_repo))

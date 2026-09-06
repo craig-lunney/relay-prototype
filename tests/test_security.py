@@ -136,7 +136,15 @@ def test_sec9_timeout_recorded_correctly(tmp_db, audit, policy, sample_task, tmp
     """A timed-out execution is recorded with TIMEOUT status, not silently lost."""
     def timeout_popen(*args, **kwargs):
         proc = MagicMock()
-        proc.communicate.side_effect = subprocess.TimeoutExpired(args[0] if args else "cmd", 1)
+        call_count = [0]
+
+        def communicate(timeout=None):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                raise subprocess.TimeoutExpired(args[0] if args else "cmd", timeout or 1)
+            return ("", "")
+
+        proc.communicate.side_effect = communicate
         proc.returncode = -1
         return proc
 
@@ -190,7 +198,7 @@ def test_sec11_malicious_repo_instruction_ignored(policy, test_repo):
     This test confirms that reading the repository content has no effect on policy.
     """
     # Read the "malicious" content from the test repository
-    calc_content = (test_repo / "calculator.py").read_text()
+    calc_content = (test_repo / "calculator.py").read_text(encoding="utf-8")
     assert "RELAY POLICY OVERRIDE" in calc_content  # the injection string is present
 
     # Policy is unchanged before and after "reading" the file

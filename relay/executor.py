@@ -139,7 +139,7 @@ class ExecutionEngine:
         base.mkdir(parents=True, exist_ok=True)
         workspace = str(base / task.task_id)
         if Path(workspace).exists():
-            shutil.rmtree(workspace)
+            shutil.rmtree(workspace, onerror=_rm_readonly)
         shutil.copytree(task.repository, workspace)
         return workspace
 
@@ -320,3 +320,10 @@ Note: Relay independently verifies all claims. The report is evidence, not autho
 def _try_json(s: str) -> Any:
     import json
     return json.loads(s)
+
+
+def _rm_readonly(func, path, exc_info):
+    """Allow shutil.rmtree to delete read-only files on Windows (e.g. inside .git)."""
+    import stat
+    os.chmod(path, stat.S_IWRITE)
+    func(path)
