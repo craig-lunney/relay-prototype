@@ -3,13 +3,15 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 from .audit import AuditLog
 from .executor import ExecutionEngine
-from .models import Task, TaskStatus
+from .models import Approval, Task, TaskStatus
 from .policy import PolicyEngine
 from .recovery import RecoveryEngine
+from .schemas import ValidationError, validate_task_input
 from .state import StateManager
 from .verifier import Verifier
 
@@ -27,6 +29,15 @@ def cmd_create_task(args) -> None:
     state, policy, audit = _make_components(args.db)
 
     task_def = json.loads(Path(args.task_file).read_text(encoding="utf-8"))
+
+    # P1-E: validate task definition structure before any state is created.
+    # Rejects missing fields, wrong types, and unexpected fields (e.g. "approved":true).
+    try:
+        validate_task_input(task_def)
+    except ValidationError as exc:
+        print(f"Invalid task definition: {exc}", file=sys.stderr)
+        sys.exit(1)
+
     task = Task(
         task_id=Task.new_id(),
         project_id=task_def["project_id"],
@@ -52,10 +63,19 @@ def cmd_create_task(args) -> None:
     audit.policy_checked(task.task_id, result.allowed, result.reason)
 
     if result.allowed:
-        state.update_task_status(task.task_id, TaskStatus.READY)
-        audit.task_validated(task.task_id)
-        print(f"Task created and validated: {task.task_id}")
-        print(f"Status: READY")
+        if result.requires_approval:
+            # P1-F: manual approval required — task enters BLOCKED state.
+            # Execution is forbidden until an operator runs 'relay approve-task'.
+            state.update_task_status(task.task_id, TaskStatus.BLOCKED)
+            audit.task_approval_required(task.task_id)
+            print(f"Task created and validated: {task.task_id}")
+            print(f"Status: BLOCKED (awaiting manual human approval)")
+            print(f"Run: relay approve-task {task.task_id} --actor <name>")
+        else:
+            state.update_task_status(task.task_id, TaskStatus.READY)
+            audit.task_validated(task.task_id)
+            print(f"Task created and validated: {task.task_id}")
+            print(f"Status: READY")
     else:
         state.update_task_status(
             task.task_id, TaskStatus.REJECTED, error=result.reason
@@ -122,6 +142,93 @@ def cmd_run_task(args) -> None:
         )
         print(f"Task {task.task_id}: TIMEOUT", file=sys.stderr)
         sys.exit(1)
+
+
+def cmd_approve_task(args) -> None:
+    """Record a Relay operator approval, unblocking a manual-policy task."""
+    state, _, audit = _make_components(args.db)
+    task = state.get_task(args.task_id)
+
+    if task is None:
+        print(f"Task {args.task_id} not found.", file=sys.stderr)
+        sys.exit(1)
+    if task.status != TaskStatus.BLOCKED:
+        print(
+            f"Task {args.task_id} is {task.status.value}. "
+            "Only BLOCKED tasks can be approved.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    if task.approval_policy != "manual":
+        print(
+            f"Task {args.task_id} has approval_policy={task.approval_policy!r}. "
+            "Only manual-policy tasks use the approval gate.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    # P1-F: is_human=True is set HERE and only here — in the Relay operator CLI path.
+    # This flag is never set from task JSON, repository content, or agent output.
+    # The security boundary is this code path, not the actor string (the prototype
+    # has no operator authentication mechanism).
+    approval = Approval(
+        approval_id=Approval.new_id(),
+        task_id=task.task_id,
+        approver=args.actor,
+        decision="APPROVED",
+        reason=getattr(args, "reason", None),
+        timestamp=datetime.now(timezone.utc),
+        is_human=True,
+    )
+    state.record_approval(approval)
+    state.update_task_status(task.task_id, TaskStatus.READY)
+    audit.task_approved(task.task_id, approval.approval_id, args.actor,
+                        getattr(args, "reason", None))
+
+    print(f"Task {task.task_id} approved.")
+    print(f"Approval ID: {approval.approval_id}")
+    print(f"Approver:    {args.actor}")
+    print(f"Status:      READY")
+
+
+def cmd_reject_task(args) -> None:
+    """Record a Relay operator rejection, terminating a manual-policy task."""
+    state, _, audit = _make_components(args.db)
+    task = state.get_task(args.task_id)
+
+    if task is None:
+        print(f"Task {args.task_id} not found.", file=sys.stderr)
+        sys.exit(1)
+    if task.status != TaskStatus.BLOCKED:
+        print(
+            f"Task {args.task_id} is {task.status.value}. "
+            "Only BLOCKED tasks can be rejected via this command.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    reason = getattr(args, "reason", None)
+    approval = Approval(
+        approval_id=Approval.new_id(),
+        task_id=task.task_id,
+        approver=args.actor,
+        decision="REJECTED",
+        reason=reason,
+        timestamp=datetime.now(timezone.utc),
+        is_human=True,
+    )
+    state.record_approval(approval)
+    state.update_task_status(
+        task.task_id,
+        TaskStatus.REJECTED,
+        error=f"Rejected by {args.actor!r}: {reason or 'no reason given'}",
+    )
+    audit.task_approval_rejected(task.task_id, approval.approval_id, args.actor, reason)
+
+    print(f"Task {task.task_id} rejected.")
+    print(f"Approval ID: {approval.approval_id}")
+    print(f"Approver:    {args.actor}")
+    print(f"Status:      REJECTED")
 
 
 def cmd_status(args) -> None:
@@ -195,6 +302,18 @@ def main() -> None:
     p.add_argument("--workspace", default="./workspaces", help="Workspace base directory")
     p.add_argument("--timeout", type=int, default=120, help="Execution timeout (seconds)")
     p.set_defaults(func=cmd_run_task)
+
+    p = sub.add_parser("approve-task", help="Record a human approval for a BLOCKED manual task")
+    p.add_argument("task_id")
+    p.add_argument("--actor", required=True, help="Identity of the approving operator")
+    p.add_argument("--reason", default=None, help="Optional reason for approval")
+    p.set_defaults(func=cmd_approve_task)
+
+    p = sub.add_parser("reject-task", help="Record a human rejection for a BLOCKED manual task")
+    p.add_argument("task_id")
+    p.add_argument("--actor", required=True, help="Identity of the rejecting operator")
+    p.add_argument("--reason", default=None, help="Optional reason for rejection")
+    p.set_defaults(func=cmd_reject_task)
 
     p = sub.add_parser("status", help="Show task status and execution history")
     p.add_argument("task_id")

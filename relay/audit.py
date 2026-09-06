@@ -62,6 +62,35 @@ class AuditLog:
             "reason": reason,
         }, execution_id=execution_id)
 
+    def task_approval_required(self, task_id: str) -> AuditEvent:
+        return self._emit(AuditEventType.TASK_APPROVAL_REQUIRED, task_id, {})
+
+    def task_approved(
+        self,
+        task_id: str,
+        approval_id: str,
+        approver: str,
+        reason: str | None = None,
+    ) -> AuditEvent:
+        return self._emit(AuditEventType.TASK_APPROVED, task_id, {
+            "approval_id": approval_id,
+            "approver": approver,
+            "reason": reason,
+        })
+
+    def task_approval_rejected(
+        self,
+        task_id: str,
+        approval_id: str,
+        approver: str,
+        reason: str | None = None,
+    ) -> AuditEvent:
+        return self._emit(AuditEventType.TASK_APPROVAL_REJECTED, task_id, {
+            "approval_id": approval_id,
+            "approver": approver,
+            "reason": reason,
+        })
+
     def execution_started(
         self, task_id: str, execution_id: str, workspace: str, attempt: int
     ) -> AuditEvent:

@@ -8,6 +8,7 @@ from pathlib import Path
 
 from .models import (
     ALLOWED_TRANSITIONS,
+    Approval,
     AuditEvent,
     AuditEventType,
     Execution,
@@ -415,6 +416,74 @@ class StateManager:
             started_at=_parse_dt(row["started_at"]),
             expires_at=_parse_dt(row["expires_at"]),
             worker_identity=row["worker_identity"],
+        )
+
+    # ── Approvals ─────────────────────────────────────────────────────────────
+
+    def record_approval(self, approval: Approval) -> None:
+        """
+        Persist a Relay operator approval or rejection decision.
+
+        is_human=True is set by the caller — it must only be True when invoked
+        from the Relay operator CLI (approve-task / reject-task). This method
+        does not authenticate the caller; the security boundary is the explicit
+        operator code path, not a flag value.
+
+        Agent output, task JSON, and repository content MUST NOT call this method.
+        """
+        conn = self._conn()
+        conn.execute(
+            """
+            INSERT INTO approvals
+                (approval_id, task_id, approver, decision, reason, timestamp, is_human)
+            VALUES (?,?,?,?,?,?,?)
+            """,
+            (
+                approval.approval_id, approval.task_id, approval.approver,
+                approval.decision, approval.reason,
+                approval.timestamp.isoformat(),
+                1 if approval.is_human else 0,
+            ),
+        )
+        conn.commit()
+
+    def get_valid_approval_for_task(self, task_id: str) -> Approval | None:
+        """
+        Return the most recent APPROVED human approval for this task, or None.
+
+        An approval is valid if and only if:
+          - task_id matches
+          - decision == 'APPROVED'
+          - is_human == 1 (recorded via the Relay operator path)
+        A rejected decision or a non-human approval does not satisfy this check.
+        """
+        row = self._conn().execute(
+            """
+            SELECT * FROM approvals
+            WHERE task_id=? AND decision='APPROVED' AND is_human=1
+            ORDER BY timestamp DESC LIMIT 1
+            """,
+            (task_id,),
+        ).fetchone()
+        return self._row_to_approval(row) if row else None
+
+    def get_approval_for_task(self, task_id: str) -> Approval | None:
+        """Return the most recent approval record (any decision) for this task."""
+        row = self._conn().execute(
+            "SELECT * FROM approvals WHERE task_id=? ORDER BY timestamp DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        return self._row_to_approval(row) if row else None
+
+    def _row_to_approval(self, row: sqlite3.Row) -> Approval:
+        return Approval(
+            approval_id=row["approval_id"],
+            task_id=row["task_id"],
+            approver=row["approver"],
+            decision=row["decision"],
+            reason=row["reason"],
+            timestamp=_parse_dt(row["timestamp"]),
+            is_human=bool(row["is_human"]),
         )
 
     # ── Events (append-only) ──────────────────────────────────────────────────

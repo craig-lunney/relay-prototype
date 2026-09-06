@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 from .paths import InvalidTestSpecifierError, validate_required_tests
+
+if TYPE_CHECKING:
+    from .state import StateManager
 
 POLICY_VERSION = "0.1"
 
@@ -41,6 +45,7 @@ class PolicyResult:
     policy_version: str = POLICY_VERSION
     denied_capabilities: list[str] = field(default_factory=list)
     denied_actions: list[str] = field(default_factory=list)
+    requires_approval: bool = False
 
 
 class PolicyEngine:
@@ -122,7 +127,67 @@ class PolicyEngine:
                 reason=f"Invalid required_tests entry: {exc}",
             )
 
+        # P1-F: signal that manual human approval is required before execution.
+        # The task definition is structurally valid (allowed=True), but the caller
+        # must place the task in BLOCKED state and wait for an explicit Relay operator
+        # approval before execution can proceed.
+        if task.approval_policy == "manual":
+            return PolicyResult(
+                allowed=True,
+                reason=(
+                    "Task validated. Manual human approval required before execution. "
+                    "Task will be placed in BLOCKED state pending operator approval."
+                ),
+                requires_approval=True,
+            )
+
         return PolicyResult(allowed=True, reason="Task validated against policy.")
+
+    def requires_manual_approval(self, task) -> bool:
+        """Return True if this task requires explicit human approval before execution."""
+        return task.approval_policy == "manual"
+
+    def check_execution_approved(self, task, state: "StateManager") -> PolicyResult:
+        """
+        Verify that a valid Relay-recorded human approval exists for a manual task.
+
+        For auto-policy tasks this always returns allowed=True.
+
+        For manual-policy tasks, an approval is valid if and only if:
+          - An approval record exists for this task_id in the database.
+          - The decision is "APPROVED" (not "REJECTED").
+          - is_human=True (the record was created via the Relay operator path,
+            never from task JSON, repository content, or agent output).
+
+        This is defence-in-depth: the primary barrier is that manual tasks are placed
+        in BLOCKED state and cmd_run_task refuses BLOCKED tasks before reaching the
+        executor. This check covers the case where the task status was manipulated
+        directly or the executor is called outside the CLI.
+
+        Schema validation (P1-E) and the operator-only approval path (P1-F) together
+        ensure that an "approved: true" field in task input or agent output cannot
+        satisfy this check — approval must pass through record_approval() with
+        is_human=True, which only the Relay CLI approval commands invoke.
+        """
+        if task.approval_policy != "manual":
+            return PolicyResult(
+                allowed=True,
+                reason="Automatic approval policy — no manual approval required.",
+            )
+        approval = state.get_valid_approval_for_task(task.task_id)
+        if approval is None:
+            return PolicyResult(
+                allowed=False,
+                reason=(
+                    f"Task {task.task_id} requires manual human approval before "
+                    "execution. No valid Relay-recorded approval exists. "
+                    "Run: relay approve-task <task_id> --actor <name>"
+                ),
+            )
+        return PolicyResult(
+            allowed=True,
+            reason=f"Valid human approval {approval.approval_id} recorded by {approval.approver!r}.",
+        )
 
     def can_task_grant_capability(self, _task, capability: str) -> PolicyResult:
         """

@@ -46,6 +46,7 @@ from .models import (
 )
 from .paths import WorkspaceBoundaryError, assert_within_workspace
 from .policy import POLICY_VERSION, PolicyEngine
+from .schemas import ValidationError, validate_report
 from .state import StateManager
 
 MAX_TIMEOUT_SECONDS = 300     # hard ceiling per execution
@@ -103,6 +104,33 @@ class ExecutionEngine:
                 f"Task {task.task_id} has exhausted its {task.max_execution_attempts} "
                 "allowed attempts. Manual intervention required."
             )
+
+        # P1-F: approval gate — defence-in-depth check before any workspace is
+        # prepared or any lease is acquired. The primary barrier is that manual tasks
+        # are placed in BLOCKED state and cmd_run_task refuses non-READY tasks.
+        # This check covers direct executor calls or status manipulation bypasses.
+        # No workspace is prepared, no lease acquired, no attempt count incremented,
+        # and Claude is never launched for an unapproved manual-policy task.
+        approval_check = self._policy.check_execution_approved(task, self._state)
+        if not approval_check.allowed:
+            exec_id = Execution.new_id()
+            now = datetime.now(timezone.utc)
+            execution = Execution(
+                execution_id=exec_id,
+                task_id=task.task_id,
+                attempt_number=task.attempt_count + 1,
+                status=ExecutionStatus.FAILED,
+                workspace="",
+                worker_identity=_worker_identity(),
+                policy_version=POLICY_VERSION,
+                capability_snapshot=[],
+                started_at=now,
+                ended_at=now,
+                error=f"Execution blocked: {approval_check.reason}",
+            )
+            self._state.create_execution(execution)
+            self._audit.execution_blocked(task.task_id, exec_id, execution.error)
+            return execution
 
         workspace = self._prepare_workspace(task, workspace_base)
 
@@ -362,6 +390,13 @@ Note: Relay independently verifies all claims. The report is evidence, not autho
             try:
                 data = _try_json(match.group(0))
                 if isinstance(data, dict) and data.get("message_type") == "IMPLEMENTATION_REPORT":
+                    # P1-E: validate structure before consuming. ValidationError →
+                    # skip this match; Relay treats an absent/malformed report as
+                    # uncertainty, not as success.
+                    try:
+                        validate_report(data)
+                    except ValidationError:
+                        continue
                     return ImplementationReport.from_dict(data)
             except (ValueError, TypeError):
                 pass
@@ -370,6 +405,10 @@ Note: Relay independently verifies all claims. The report is evidence, not autho
         try:
             data = _try_json(output.strip())
             if isinstance(data, dict) and data.get("message_type") == "IMPLEMENTATION_REPORT":
+                try:
+                    validate_report(data)
+                except ValidationError:
+                    return None
                 return ImplementationReport.from_dict(data)
         except (ValueError, TypeError):
             pass

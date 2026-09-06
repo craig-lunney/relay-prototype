@@ -38,6 +38,9 @@ class AuditEventType(str, Enum):
     TASK_VALIDATED = "TASK_VALIDATED"
     TASK_REJECTED = "TASK_REJECTED"
     POLICY_CHECKED = "POLICY_CHECKED"
+    TASK_APPROVAL_REQUIRED = "TASK_APPROVAL_REQUIRED"
+    TASK_APPROVED = "TASK_APPROVED"
+    TASK_APPROVAL_REJECTED = "TASK_APPROVAL_REJECTED"
     EXECUTION_STARTED = "EXECUTION_STARTED"
     EXECUTION_COMPLETED = "EXECUTION_COMPLETED"
     EXECUTION_FAILED = "EXECUTION_FAILED"
@@ -62,7 +65,7 @@ ALLOWED_TRANSITIONS: dict[TaskStatus, frozenset[TaskStatus]] = {
     TaskStatus.VERIFYING:         frozenset({TaskStatus.COMPLETED, TaskStatus.FAILED}),
     TaskStatus.COMPLETED:         frozenset(),
     TaskStatus.FAILED:            frozenset(),
-    TaskStatus.BLOCKED:           frozenset({TaskStatus.READY, TaskStatus.CANCELLED}),
+    TaskStatus.BLOCKED:           frozenset({TaskStatus.READY, TaskStatus.CANCELLED, TaskStatus.REJECTED}),
     TaskStatus.TIMEOUT:           frozenset({TaskStatus.READY, TaskStatus.CANCELLED}),
     TaskStatus.CANCELLED:         frozenset(),
     TaskStatus.REJECTED:          frozenset(),
@@ -206,3 +209,26 @@ class AuditEvent:
     @classmethod
     def new_id(cls) -> str:
         return f"EVT-{uuid.uuid4().hex[:8].upper()}"
+
+
+@dataclass
+class Approval:
+    """
+    A Relay-recorded human approval or rejection for a manual-approval task.
+
+    is_human=True is set ONLY by the Relay operator CLI (approve-task / reject-task
+    commands). It is never set from task JSON, repository content, or agent output.
+    The security boundary is the code path that calls record_approval() with is_human=True,
+    not the string value of the approver field (which is not authenticated in this prototype).
+    """
+    approval_id: str
+    task_id: str
+    approver: str
+    decision: str  # "APPROVED" or "REJECTED"
+    reason: str | None
+    timestamp: datetime
+    is_human: bool
+
+    @classmethod
+    def new_id(cls) -> str:
+        return f"APR-{uuid.uuid4().hex[:8].upper()}"
