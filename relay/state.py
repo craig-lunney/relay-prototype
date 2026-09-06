@@ -489,24 +489,54 @@ class StateManager:
     # ── Events (append-only) ──────────────────────────────────────────────────
 
     def append_event(self, event: AuditEvent) -> None:
-        """Append an audit event. Workers must never call this directly."""
+        """Append an audit event. Workers must never call this directly.
+
+        H-4: sequence assignment is made collision-safe via retry.  Two
+        concurrent appenders may read the same MAX(sequence) and race to
+        INSERT; the UNIQUE constraint on 'sequence' ensures only one wins.
+        The loser catches IntegrityError, rolls back, re-reads MAX, and
+        retries.  No valid audit event is silently discarded — the loop
+        raises RuntimeError only after exhausting all retries, which in
+        normal operation (sequential audit writes from a single process) will
+        never happen.
+        """
         conn = self._conn()
-        seq = (conn.execute("SELECT COALESCE(MAX(sequence),0) FROM events").fetchone()[0]) + 1
-        conn.execute(
-            """
-            INSERT INTO events
-                (event_id, sequence, event_type, task_id, execution_id,
-                 timestamp, actor, details)
-            VALUES (?,?,?,?,?,?,?,?)
-            """,
-            (
-                event.event_id, seq, event.event_type.value,
-                event.task_id, event.execution_id,
-                event.timestamp.isoformat(), event.actor,
-                json.dumps(event.details),
-            ),
+        _MAX_RETRIES = 10
+        for attempt in range(_MAX_RETRIES):
+            try:
+                seq = (
+                    conn.execute(
+                        "SELECT COALESCE(MAX(sequence),0) FROM events"
+                    ).fetchone()[0]
+                ) + 1
+                conn.execute(
+                    """
+                    INSERT INTO events
+                        (event_id, sequence, event_type, task_id, execution_id,
+                         timestamp, actor, details)
+                    VALUES (?,?,?,?,?,?,?,?)
+                    """,
+                    (
+                        event.event_id, seq, event.event_type.value,
+                        event.task_id, event.execution_id,
+                        event.timestamp.isoformat(), event.actor,
+                        json.dumps(event.details),
+                    ),
+                )
+                conn.commit()
+                return
+            except sqlite3.IntegrityError:
+                # Sequence collision: another writer committed first.
+                # Roll back and retry with a fresh MAX read.
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+        raise RuntimeError(
+            f"append_event: failed to assign a unique sequence for event "
+            f"{event.event_id!r} after {_MAX_RETRIES} attempts. "
+            "Concurrent sequence collisions not resolved."
         )
-        conn.commit()
 
     def get_events_for_task(self, task_id: str) -> list[AuditEvent]:
         rows = self._conn().execute(

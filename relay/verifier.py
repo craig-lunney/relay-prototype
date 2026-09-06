@@ -4,6 +4,7 @@ import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .executor import _worker_environment
 from .models import Execution, Task
 from .paths import InvalidTestSpecifierError, WorkspaceBoundaryError, validate_required_tests
 
@@ -121,6 +122,7 @@ class Verifier:
         result = subprocess.run(
             ["git", "branch", "--show-current"],
             cwd=workspace, capture_output=True, text=True,
+            env=_worker_environment(),  # H-1: explicit curated env; never inherit parent
         )
         if result.returncode != 0:
             errors.append(f"git branch failed: {result.stderr.strip()}")
@@ -131,6 +133,7 @@ class Verifier:
         result = subprocess.run(
             ["git", "status", "--porcelain"],
             cwd=workspace, capture_output=True, text=True,
+            env=_worker_environment(),  # H-1: explicit curated env; never inherit parent
         )
         if result.returncode != 0:
             errors.append(f"git status failed: {result.stderr.strip()}")
@@ -144,6 +147,7 @@ class Verifier:
         result = subprocess.run(
             ["git", "status", "--porcelain"],
             cwd=workspace, capture_output=True, text=True,
+            env=_worker_environment(),  # H-1: explicit curated env; never inherit parent
         )
         if result.returncode != 0:
             errors.append(f"git status --porcelain failed: {result.stderr.strip()}")
@@ -209,6 +213,7 @@ class Verifier:
                     capture_output=True,
                     text=True,
                     timeout=120,
+                    env=_worker_environment(),  # H-1: explicit curated env; never inherit parent
                 )
                 return result.returncode, result.stdout + result.stderr
             except FileNotFoundError:

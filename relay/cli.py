@@ -102,6 +102,7 @@ def cmd_run_task(args) -> None:
     engine = ExecutionEngine(state, audit, policy)
     verifier = Verifier()
     workspace_base = Path(args.workspace)
+    keep_workspace = getattr(args, "keep_workspace", False)
 
     print(f"Starting execution for {task.task_id}...")
     execution = engine.run(task, workspace_base, timeout_seconds=args.timeout)
@@ -124,12 +125,20 @@ def cmd_run_task(args) -> None:
             )
             audit.task_completed(task.task_id)
             print(f"Task {task.task_id}: COMPLETED (independently verified)")
+            # H-2: clean up workspace after successful verification, unless
+            # operator requested it be kept for inspection.
+            if not keep_workspace and execution.workspace:
+                engine.cleanup_workspace(execution.workspace, workspace_base)
         else:
             reason = f"Verification failed. Errors: {result.errors}"
             state.update_task_status(
                 task.task_id, TaskStatus.FAILED, error=reason, validate_transition=True
             )
             audit.task_failed(task.task_id, reason)
+            # H-2: clean up workspace even on verification failure; the failed
+            # state is recorded in the DB and audit log.
+            if not keep_workspace and execution.workspace:
+                engine.cleanup_workspace(execution.workspace, workspace_base)
             print(f"Task {task.task_id}: FAILED — {reason}", file=sys.stderr)
             sys.exit(1)
 
@@ -140,6 +149,10 @@ def cmd_run_task(args) -> None:
         audit.execution_timeout(
             task.task_id, execution.execution_id, args.timeout
         )
+        # H-2: clean up workspace after timeout; no recovery is in progress
+        # at this point (the lease was released by the executor).
+        if not keep_workspace and execution.workspace:
+            engine.cleanup_workspace(execution.workspace, workspace_base)
         print(f"Task {task.task_id}: TIMEOUT", file=sys.stderr)
         sys.exit(1)
 
@@ -301,6 +314,10 @@ def main() -> None:
     p.add_argument("task_id")
     p.add_argument("--workspace", default="./workspaces", help="Workspace base directory")
     p.add_argument("--timeout", type=int, default=120, help="Execution timeout (seconds)")
+    p.add_argument(
+        "--keep-workspace", action="store_true", default=False,
+        help="Preserve the task workspace directory after execution (default: delete after completion)",
+    )
     p.set_defaults(func=cmd_run_task)
 
     p = sub.add_parser("approve-task", help="Record a human approval for a BLOCKED manual task")

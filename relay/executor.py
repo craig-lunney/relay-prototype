@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+import json as _json
 import os
 import platform
-import re
 import shutil
 import subprocess
 import sys
@@ -298,6 +298,36 @@ class ExecutionEngine:
         shutil.copytree(task.repository, str(workspace))
         return str(workspace)
 
+    def cleanup_workspace(self, workspace: str, workspace_base: str | Path) -> None:
+        """
+        Delete the task workspace directory after execution and verification complete.
+
+        H-2: Fail-safe design — if the workspace path cannot be verified as
+        within workspace_base, or if deletion fails for any reason, the workspace
+        is preserved rather than deleted.  Never silently removes a workspace
+        it cannot confirm is bounded.
+
+        Callers must invoke this ONLY after independent verification has completed
+        and the task outcome is final (COMPLETED, FAILED, or TIMEOUT).  It must
+        NOT be called while an active lease is held, or when recovery may require
+        workspace inspection.
+        """
+        if not workspace:
+            return
+        ws_path = Path(workspace)
+        if not ws_path.exists():
+            return
+        try:
+            assert_within_workspace(workspace, workspace_base)
+        except (WorkspaceBoundaryError, RuntimeError):
+            # Fail-safe: cannot confirm boundary — preserve workspace.
+            return
+        try:
+            shutil.rmtree(workspace, onerror=_rm_readonly)
+        except OSError:
+            # Fail-safe: preserve on deletion error rather than raising.
+            pass
+
     def _invoke_claude(
         self,
         task: Task,
@@ -447,49 +477,52 @@ Note: Relay independently verifies all claims. The report is evidence, not autho
         """
         Extract the JSON implementation report from Claude's output.
         Returns None if no valid report is found — Relay treats absence as uncertainty.
+
+        H-3: uses json.JSONDecoder.raw_decode() to scan for top-level JSON objects.
+        raw_decode() correctly handles nested objects that the previous
+        r"\\{[^{}]*\\}" regex could not match.  The outer-wrapper unwrap is
+        preserved.  Fail-closed: malformed or invalid-structure objects are
+        skipped; absence of a valid report is uncertainty, not success.
         """
         # Handle --output-format json wrapper: {"result": "...", "type": "result"}
         try:
-            outer = _try_json(output)
+            outer = _json.loads(output)
             if isinstance(outer, dict) and "result" in outer:
                 output = str(outer["result"])
         except (ValueError, TypeError):
             pass
 
-        # Find the innermost JSON object containing "message_type"
-        for match in re.finditer(r"\{[^{}]*\}", output, re.DOTALL):
+        # Scan output for top-level JSON objects using raw_decode().
+        # Advances by one character past a failed parse attempt so we never
+        # loop infinitely on a malformed token.
+        decoder = _json.JSONDecoder()
+        idx = 0
+        while idx < len(output):
+            start = output.find("{", idx)
+            if start == -1:
+                break
             try:
-                data = _try_json(match.group(0))
-                if isinstance(data, dict) and data.get("message_type") == "IMPLEMENTATION_REPORT":
-                    # P1-E: validate structure before consuming. ValidationError →
-                    # skip this match; Relay treats an absent/malformed report as
-                    # uncertainty, not as success.
-                    try:
-                        validate_report(data)
-                    except ValidationError:
-                        continue
-                    return ImplementationReport.from_dict(data)
-            except (ValueError, TypeError):
-                pass
+                data, end = decoder.raw_decode(output, start)
+                idx = end
+            except (_json.JSONDecodeError, ValueError):
+                idx = start + 1
+                continue
 
-        # Try the whole output as a JSON object
-        try:
-            data = _try_json(output.strip())
-            if isinstance(data, dict) and data.get("message_type") == "IMPLEMENTATION_REPORT":
-                try:
-                    validate_report(data)
-                except ValidationError:
-                    return None
-                return ImplementationReport.from_dict(data)
-        except (ValueError, TypeError):
-            pass
+            if not isinstance(data, dict):
+                continue
+            if data.get("message_type") != "IMPLEMENTATION_REPORT":
+                continue
+
+            # P1-E: validate structure before consuming. ValidationError →
+            # skip this candidate; absence of a valid report is uncertainty.
+            try:
+                validate_report(data)
+            except ValidationError:
+                continue
+
+            return ImplementationReport.from_dict(data)
 
         return None
-
-
-def _try_json(s: str) -> Any:
-    import json
-    return json.loads(s)
 
 
 def _rm_readonly(func, path, exc_info):
