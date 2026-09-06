@@ -1,0 +1,38 @@
+{
+  "protocol_version": "0.1",
+  "project_id": "relay-prototype-demo",
+  "repository": "REPLACE_WITH_ABSOLUTE_PATH_TO/relay-prototype/test-repository",
+  "base_ref": "main",
+  "working_ref": "main",
+  "objective": "Fix the floor-division bug in calculate_discount_price and ensure all tests pass.",
+  "requirements": [
+    "Identify the bug in calculate_discount_price (floor division // instead of float division /)",
+    "Fix the bug by changing // to / in the discount_amount line",
+    "Verify that calculate_discount_price(99.99, 15.0) returns 84.99",
+    "Verify that calculate_discount_price(33.33, 10.0) returns 30.00",
+    "Run the full test suite and confirm all tests pass"
+  ],
+  "acceptance_criteria": [
+    "All tests pass",
+    "calculate_discount_price(99.99, 15.0) == 84.99",
+    "calculate_discount_price(33.33, 10.0) == 30.00",
+    "calculate_discount_price(4.99, 20.0) == 3.99"
+  ],
+  "requested_actions": [
+    "read_repository",
+    "modify_working_tree",
+    "run_tests"
+  ],
+  "forbidden_actions": [
+    "push",
+    "deploy",
+    "merge",
+    "modify_main",
+    "modify_relay_policy",
+    "access_production"
+  ],
+  "required_tests": [
+    "test_calculator.py"
+  ],
+  "approval_policy": "auto"
+}

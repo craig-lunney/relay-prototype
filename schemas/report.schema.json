@@ -1,0 +1,79 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "relay:report:0.1",
+  "title": "Relay Implementation Report",
+  "description": "Structured output from a Claude execution. Treated as evidence, not authoritative truth. Relay verifies all claims independently.",
+  "type": "object",
+  "required": [
+    "protocol_version",
+    "message_type",
+    "task_id",
+    "execution_id",
+    "status",
+    "summary",
+    "recommended_next_action"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "protocol_version": {
+      "type": "string",
+      "const": "0.1"
+    },
+    "message_type": {
+      "type": "string",
+      "const": "IMPLEMENTATION_REPORT"
+    },
+    "task_id": {
+      "type": "string",
+      "pattern": "^TASK-[A-F0-9]{8}$"
+    },
+    "execution_id": {
+      "type": "string",
+      "pattern": "^EXEC-[A-F0-9]{8}$"
+    },
+    "status": {
+      "type": "string",
+      "enum": ["COMPLETED", "PARTIAL", "FAILED", "BLOCKED"],
+      "description": "Claude's self-reported status. Relay does NOT accept this as authoritative COMPLETED. Independent verification is always required."
+    },
+    "summary": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Human-readable summary of what was attempted."
+    },
+    "files_changed": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Files Claude believes it modified. Relay cross-checks via git status."
+    },
+    "files_added": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "files_deleted": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "tests_run": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Tests Claude ran. Relay re-runs them independently."
+    },
+    "risks": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "uncertainties": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "blockers": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "recommended_next_action": {
+      "type": "string",
+      "description": "Claude's suggestion for what Relay should do next. Advisory only."
+    }
+  }
+}

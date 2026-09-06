@@ -1,0 +1,80 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "relay:task:0.1",
+  "title": "Relay Task Definition",
+  "description": "Machine-readable task definition for Project Relay Prototype 0.",
+  "type": "object",
+  "required": [
+    "protocol_version",
+    "project_id",
+    "repository",
+    "objective",
+    "requested_actions"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "protocol_version": {
+      "type": "string",
+      "const": "0.1",
+      "description": "Must match the Relay protocol version."
+    },
+    "project_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "repository": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Absolute path to the repository. Must not be a production system."
+    },
+    "base_ref": {
+      "type": "string",
+      "default": "main",
+      "description": "The ref that existed before this task. Used by the verifier as a baseline."
+    },
+    "working_ref": {
+      "type": "string",
+      "default": "main",
+      "description": "The ref Claude will work on inside the workspace copy."
+    },
+    "objective": {
+      "type": "string",
+      "minLength": 10,
+      "description": "Plain-language description of what should be achieved."
+    },
+    "requirements": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Specific requirements the implementation must satisfy."
+    },
+    "acceptance_criteria": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Deterministically verifiable criteria that must be met for COMPLETED."
+    },
+    "requested_actions": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "enum": ["read_repository", "modify_working_tree", "run_tests"]
+      },
+      "description": "Capabilities this task requests. Relay policy is the authority — tasks cannot grant themselves additional capabilities."
+    },
+    "forbidden_actions": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Actions the task itself explicitly forbids (in addition to Relay's global policy)."
+    },
+    "required_tests": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Test files or patterns that Relay's verifier must run independently."
+    },
+    "approval_policy": {
+      "type": "string",
+      "enum": ["auto", "human_required"],
+      "default": "auto",
+      "description": "auto = Relay decides; human_required = privileged action needs human sign-off."
+    }
+  }
+}
