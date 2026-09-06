@@ -91,12 +91,16 @@ class RecoveryEngine:
                 "Manual intervention required."
             )
 
-        # Ensure no active lease is still outstanding
-        lease = self._state.get_active_lease(task.repository)
-        if lease:
+        # P1-C: check for active leases on the task's actual workspace path(s).
+        # Pre-fix bug: this called get_active_lease(task.repository), which is the
+        # SOURCE repository path — never a lease workspace (leases are issued on
+        # workspace copies, not the source repo). That check always returned None,
+        # making the guard ineffective.
+        leases = self._state.get_active_leases_for_task(task_id)
+        if leases:
             return False, (
-                f"Active lease {lease.execution_id} still exists on the workspace. "
-                "Cannot restart safely."
+                f"Active lease {leases[0].execution_id} still exists on workspace "
+                f"{leases[0].workspace!r}. Cannot restart safely."
             )
 
         return True, "Safe to reset to READY."

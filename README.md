@@ -1,4 +1,4 @@
-# Project Relay — Prototype 0
+# Project Relay — Prototype 1 (P1-A: Worker Configuration Isolation)
 
 Research prototype for safe AI-to-AI engineering collaboration.
 
@@ -137,9 +137,74 @@ relay --db relay.db recover
 pytest tests/ -v
 ```
 
-95 tests, including 15 security tests mapped to the spec requirements.
+100 tests (95 Prototype 0 + 5 P1-A isolation tests), including 15 security tests.
 The test-repository does **not** need to be git-initialised for the tests —
 `conftest.py` does this per-test in a temp directory.
+
+---
+
+## P1-A: Worker Configuration Isolation
+
+### CF-01
+
+**Finding (Prototype 0 acceptance):** The operator's global
+`~/.claude/CLAUDE.md` was loaded by a Claude subprocess launched by Relay.
+That file contained session-start instructions unrelated to the Relay task
+(invoking a lunneys-magento skill), causing the worker to begin an unrelated
+workflow instead of executing the assigned engineering task.
+
+**Root cause:** `executor.py` passed no `--bare` flag to the Claude subprocess
+and no isolated configuration directory. Claude performed CLAUDE.md
+auto-discovery in its default mode, finding and loading the operator's global
+`~/.claude/CLAUDE.md`.
+
+### How Relay isolates worker configuration
+
+`_invoke_claude()` now passes two additional flags to the Claude CLI:
+
+| Flag | Effect |
+|------|--------|
+| `--bare` | Disables CLAUDE.md auto-discovery, hooks, auto-memory, keychain reads, and plugin sync. The operator's global `~/.claude/CLAUDE.md` is never loaded. |
+| `--add-dir relay/worker_config/` | Explicitly loads the Relay-owned `CLAUDE.md` from the worker config directory. This is the only configuration file the worker sees. |
+
+The isolation is enforced at the process boundary (CLI flags), not by prompt
+instruction. A worker cannot opt out of `--bare` by reading a file.
+
+### Worker configuration (`relay/worker_config/`)
+
+**Contains:**
+- `CLAUDE.md` — minimal task context. Tells the worker it is in an isolated
+  workspace and must execute only the prompt-assigned task.
+
+**Deliberately does NOT contain:**
+- Any copy of the operator's global configuration
+- API keys, passwords, tokens, or any credential values
+- OAuth state, keychain entries, or authentication files
+- MCP server configurations
+- Hooks or plugin definitions
+
+**Security rationale:** The worker configuration is minimal by design. Its only
+role is to replace the auto-discovered global config with a benign, Relay-owned
+context. Operators should not add credentials here — use `ANTHROPIC_API_KEY`
+in the process environment for API authentication.
+
+**Note on authentication:** `--bare` requires `ANTHROPIC_API_KEY` to be set in
+the environment for Claude API calls. OAuth credentials stored in the keychain
+are not read in `--bare` mode. This is a known limitation of P1-A; credential
+management is out of scope for this prototype.
+
+### Test coverage (CF-01)
+
+| Test | What it proves |
+|------|---------------|
+| `test_global_config_not_inherited` | `--bare` is in the command; fake global config path is absent |
+| `test_worker_config_is_used` | `--add-dir` points to `relay/worker_config/`; marker present in CLAUDE.md |
+| `test_no_credentials_in_worker_config` | No forbidden files; no credential patterns in CLAUDE.md |
+| Existing tests (95) | `_invoke_claude()` change is backwards-compatible; all pass |
+| `test_cf01_global_config_cannot_override_worker_config` | Full CF-01 simulation: fake global config + redirected HOME; `--bare` + correct `--add-dir` verified |
+
+All tests inspect the actual `subprocess.Popen` arguments, not just Python
+variables, verifying the process-level configuration boundary.
 
 ---
 

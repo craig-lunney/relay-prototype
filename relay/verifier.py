@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .models import Execution, Task
+from .paths import InvalidTestSpecifierError, WorkspaceBoundaryError, validate_required_tests
 
 
 @dataclass
@@ -56,7 +57,31 @@ class Verifier:
         execution: Execution,
         expected_new_files: list[str] | None = None,
     ) -> VerificationResult:
-        workspace = execution.workspace
+        # P1-C: canonicalize the workspace path from the execution record before any
+        # operations. Fail closed if the path is not a real directory.
+        raw_workspace = execution.workspace
+        try:
+            canonical_ws = Path(raw_workspace).resolve()
+            if not canonical_ws.is_dir():
+                raise WorkspaceBoundaryError(
+                    f"Workspace {raw_workspace!r} is not an existing directory."
+                )
+        except WorkspaceBoundaryError as exc:
+            return VerificationResult(
+                passed=False,
+                branch="UNKNOWN",
+                git_status_lines=[],
+                files_changed=[],
+                files_added=[],
+                files_deleted=[],
+                unexpected_files=[],
+                test_exit_code=None,
+                test_output="",
+                acceptance_results={},
+                report_agreement={},
+                errors=[f"Workspace boundary error: {exc}"],
+            )
+        workspace = str(canonical_ws)
         errors: list[str] = []
 
         branch = self._get_branch(workspace, errors)
@@ -155,11 +180,28 @@ class Verifier:
         if not required_tests:
             return None, ""
 
-        # Try python -m pytest first (most portable), fall back to bare pytest
-        for cmd in (
-            ["python", "-m", "pytest"] + required_tests + ["-v", "--tb=short"],
-            ["pytest"] + required_tests + ["-v", "--tb=short"],
+        # P1-D: validate test specifiers against workspace boundary before constructing
+        # the subprocess command. Rejects option injection, control characters, and
+        # path traversal. This is defence-in-depth — the primary barrier is shell=False
+        # and the '--' separator below, but we fail closed on malformed specifiers.
+        try:
+            validate_required_tests(required_tests, workspace)
+        except InvalidTestSpecifierError as exc:
+            errors.append(f"Invalid test specifier rejected: {exc}")
+            return None, ""
+
+        # Options before '--', test specifiers after '--'.
+        # The '--' separator is the authoritative option/argument boundary:
+        # any value after it is treated as a positional argument (file/node path),
+        # never as a pytest option — even if it starts with '-'.
+        # shell=False (the default) ensures no shell interpretation occurs.
+        test_args = ["-v", "--tb=short", "--"] + required_tests
+
+        for cmd_prefix in (
+            ["python", "-m", "pytest"],
+            ["pytest"],
         ):
+            cmd = cmd_prefix + test_args
             try:
                 result = subprocess.run(
                     cmd,

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from .paths import InvalidTestSpecifierError, validate_required_tests
+
 POLICY_VERSION = "0.1"
 
 # What a Prototype 0 execution may do.
@@ -108,6 +110,17 @@ class PolicyEngine:
                         f"pattern '{pattern}'. Prototype 0 must not touch production systems."
                     ),
                 )
+
+        # P1-D: validate required_tests entries (no option injection, no control chars).
+        # Workspace is not available at policy-check time, so path boundary validation
+        # happens later in the verifier. This catches syntactic injection attempts early.
+        try:
+            validate_required_tests(task.required_tests)
+        except InvalidTestSpecifierError as exc:
+            return PolicyResult(
+                allowed=False,
+                reason=f"Invalid required_tests entry: {exc}",
+            )
 
         return PolicyResult(allowed=True, reason="Task validated against policy.")
 

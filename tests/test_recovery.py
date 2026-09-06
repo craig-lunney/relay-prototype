@@ -222,3 +222,68 @@ def test_interrupted_execution_marked_interrupted(tmp_db, audit, sample_task):
     assert saved_exec.status == ExecutionStatus.INTERRUPTED
     assert saved_exec.error is not None
     assert saved_exec.ended_at is not None
+
+
+# ── C8: Recovery boundary regression ─────────────────────────────────────────
+
+def test_c8_restart_blocked_by_workspace_lease_not_repository(tmp_db, audit, sample_task, tmp_path):
+    """
+    C8 regression: can_safely_restart() must check the task's WORKSPACE lease,
+    not task.repository.
+
+    Pre-fix bug: the check called get_active_lease(task.repository). Leases are
+    issued on WORKSPACE copies (e.g. workspace_base/task_id), never on the source
+    repository path. That call always returned None, so the guard was ineffective —
+    a task with an active workspace lease could be incorrectly declared safe to restart.
+
+    This test creates an active lease on the WORKSPACE path (distinct from the
+    repository path), sets the task to RECOVERY_REQUIRED, and verifies that
+    can_safely_restart() correctly returns (False, ...) because the workspace lease
+    is detected via get_active_leases_for_task().
+    """
+    # Set task to RECOVERY_REQUIRED (the only valid input for can_safely_restart)
+    tmp_db.update_task_status(
+        sample_task.task_id, TaskStatus.RECOVERY_REQUIRED, validate_transition=False
+    )
+
+    # Create an execution whose workspace is NOT the same as task.repository
+    workspace = str(tmp_path / "ws" / sample_task.task_id)
+    now = _now()
+    exec_ = Execution(
+        execution_id=Execution.new_id(),
+        task_id=sample_task.task_id,
+        attempt_number=1,
+        status=ExecutionStatus.INTERRUPTED,
+        workspace=workspace,
+        worker_identity="test-worker",
+        policy_version="0.1",
+        capability_snapshot=[],
+        started_at=now - timedelta(seconds=60),
+    )
+    tmp_db.create_execution(exec_)
+
+    # Acquire a lease on the workspace path (not task.repository)
+    lease = ExecutionLease(
+        execution_id=exec_.execution_id,
+        task_id=sample_task.task_id,
+        workspace=workspace,
+        pid=12345,
+        started_at=now - timedelta(seconds=60),
+        expires_at=now + timedelta(seconds=300),
+        worker_identity="test-worker",
+    )
+    tmp_db.acquire_lease(lease)
+
+    # Confirm the repository path has NO lease (pre-fix check would see None and
+    # incorrectly allow restart)
+    assert tmp_db.get_active_lease(sample_task.repository) is None
+
+    # The fixed check must find the workspace lease and block restart
+    engine = RecoveryEngine(tmp_db, audit)
+    can_restart, reason = engine.can_safely_restart(sample_task.task_id)
+
+    assert not can_restart, (
+        "Expected restart to be blocked by active workspace lease, but it was allowed"
+    )
+    assert "lease" in reason.lower(), f"Expected 'lease' in reason: {reason!r}"
+    assert workspace in reason or exec_.execution_id in reason

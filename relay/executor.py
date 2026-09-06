@@ -10,6 +10,31 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+# Relay-owned worker configuration directory.
+# The CLAUDE.md here is the ONLY configuration file loaded by the worker subprocess.
+# The operator's global ~/.claude/CLAUDE.md is never loaded (--bare disables auto-discovery).
+RELAY_WORKER_CONFIG_DIR = Path(__file__).parent / "worker_config"
+
+_WORKER_CLAUDE_MD = """\
+# Relay Worker Configuration
+
+RELAY_WORKER_CONFIG_ACTIVE
+
+You are a Relay worker operating in an isolated, disposable workspace.
+Execute only the task described in your prompt.
+Do not perform any actions outside the workspace.
+This is a controlled research prototype environment.
+"""
+
+
+def _ensure_worker_config() -> Path:
+    """Return the Relay worker config directory, writing CLAUDE.md if absent."""
+    RELAY_WORKER_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    claude_md = RELAY_WORKER_CONFIG_DIR / "CLAUDE.md"
+    if not claude_md.exists():
+        claude_md.write_text(_WORKER_CLAUDE_MD, encoding="utf-8")
+    return RELAY_WORKER_CONFIG_DIR
+
 from .audit import AuditLog
 from .models import (
     Execution,
@@ -19,6 +44,7 @@ from .models import (
     Task,
     TaskStatus,
 )
+from .paths import WorkspaceBoundaryError, assert_within_workspace
 from .policy import POLICY_VERSION, PolicyEngine
 from .state import StateManager
 
@@ -60,8 +86,14 @@ class ExecutionEngine:
     ) -> Execution:
         """
         Run one execution attempt for a task.
-        - Never runs two executions on the same workspace simultaneously.
-        - Records state even on timeout or error.
+
+        P1-B design:
+        - acquire_lease() is the sole authoritative workspace gate.
+        - No preliminary get_active_lease() check — that was a TOCTOU window.
+        - attempt_count and task status are only updated after a successful lease.
+        - Claude is never launched without a successfully owned lease.
+        - Failed lease acquisition produces a clean FAILED execution record,
+          does not increment attempt_count, and does not change task status.
         - Relay (not Claude) decides the authoritative result.
         """
         timeout_seconds = min(timeout_seconds, MAX_TIMEOUT_SECONDS)
@@ -74,13 +106,16 @@ class ExecutionEngine:
 
         workspace = self._prepare_workspace(task, workspace_base)
 
-        existing_lease = self._state.get_active_lease(workspace)
-        if existing_lease:
+        # P1-C: verify the workspace is within the canonical workspace_base before
+        # creating any state. Raises RuntimeError if boundary cannot be established.
+        # In normal operation this always passes (workspace = canonical_base / task_id),
+        # but acts as a defence-in-depth guard against tampered task_id or path injection.
+        try:
+            assert_within_workspace(workspace, workspace_base)
+        except WorkspaceBoundaryError as exc:
             raise RuntimeError(
-                f"Workspace '{workspace}' already has an active lease "
-                f"({existing_lease.execution_id}). "
-                "Refusing to start a concurrent execution."
-            )
+                f"Workspace boundary violation for task {task.task_id}: {exc}"
+            ) from exc
 
         exec_id = Execution.new_id()
         now = datetime.now(timezone.utc)
@@ -97,10 +132,6 @@ class ExecutionEngine:
             started_at=now,
         )
         self._state.create_execution(execution)
-        self._state.increment_attempt_count(task.task_id)
-        self._state.update_task_status(
-            task.task_id, TaskStatus.RUNNING, validate_transition=True
-        )
 
         lease = ExecutionLease(
             execution_id=exec_id,
@@ -111,14 +142,38 @@ class ExecutionEngine:
             expires_at=now + timedelta(seconds=timeout_seconds + LEASE_GRACE_SECONDS),
             worker_identity=_worker_identity(),
         )
+
+        # acquire_lease() is the authoritative workspace gate.
+        # The UNIQUE partial index enforces exclusivity at the database level.
+        # Claude is never invoked without a successfully acquired lease.
         if not self._state.acquire_lease(lease):
             execution.status = ExecutionStatus.FAILED
-            execution.error = "Failed to acquire workspace lease after creation check."
+            execution.error = (
+                "Workspace lease is held by another execution. "
+                "Claude was not launched. Attempt count not incremented."
+            )
             execution.ended_at = datetime.now(timezone.utc)
             self._state.update_execution(execution)
             self._audit.execution_failed(
                 task.task_id, exec_id, execution.error
             )
+            return execution
+
+        # Lease acquired — now commit to this attempt.
+        # These operations are post-gate: they only run when we own the workspace.
+        try:
+            self._state.increment_attempt_count(task.task_id)
+            self._state.update_task_status(
+                task.task_id, TaskStatus.RUNNING, validate_transition=True
+            )
+        except Exception as exc:
+            # Unexpected error after lease acquisition — release cleanly.
+            execution.status = ExecutionStatus.FAILED
+            execution.error = f"Execution setup failed after lease acquisition: {exc}"
+            execution.ended_at = datetime.now(timezone.utc)
+            self._state.update_execution(execution)
+            self._state.release_lease(exec_id)
+            self._audit.execution_failed(task.task_id, exec_id, execution.error)
             return execution
 
         self._audit.execution_started(
@@ -135,13 +190,15 @@ class ExecutionEngine:
 
     def _prepare_workspace(self, task: Task, workspace_base: str | Path) -> str:
         """Copy the task repository into a fresh isolated workspace."""
-        base = Path(workspace_base)
+        # P1-C: resolve workspace_base to canonical form so the returned workspace
+        # path is always absolute and free of .. / . / symlink indirection.
+        base = Path(workspace_base).resolve()
         base.mkdir(parents=True, exist_ok=True)
-        workspace = str(base / task.task_id)
-        if Path(workspace).exists():
-            shutil.rmtree(workspace, onerror=_rm_readonly)
-        shutil.copytree(task.repository, workspace)
-        return workspace
+        workspace = base / task.task_id
+        if workspace.exists():
+            shutil.rmtree(str(workspace), onerror=_rm_readonly)
+        shutil.copytree(task.repository, str(workspace))
+        return str(workspace)
 
     def _invoke_claude(
         self,
@@ -157,12 +214,15 @@ class ExecutionEngine:
         """
         prompt = self._build_prompt(task, execution.execution_id)
         claude_exe = _find_claude()
+        worker_config = _ensure_worker_config()
 
         cmd = [
             claude_exe,
             "--print",
             "--max-turns", "10",
             "--output-format", "json",
+            "--bare",
+            "--add-dir", str(worker_config),
             prompt,
         ]
 

@@ -276,6 +276,11 @@ def test_sec12_completed_assertion_requires_verification(tmp_db, audit, policy, 
 def test_sec13_concurrent_workspace_blocked(tmp_db, audit, policy, sample_task, tmp_path):
     """
     The lease mechanism prevents two executions on the same workspace simultaneously.
+
+    P1-B: acquire_lease() is now the authoritative gate, backed by a UNIQUE partial
+    index at the database level. The blocked execution returns as FAILED (not RuntimeError).
+    The invariant — at most one active lease per workspace — is unchanged and now
+    enforced atomically.
     """
     engine = ExecutionEngine(tmp_db, audit, policy)
     workspace = engine._prepare_workspace(sample_task, tmp_path / "ws")
@@ -306,12 +311,15 @@ def test_sec13_concurrent_workspace_blocked(tmp_db, audit, policy, sample_task, 
     )
     tmp_db.acquire_lease(lease)
 
-    # Trying to start another execution on the same workspace must be refused
-    with pytest.raises(RuntimeError, match="active lease"):
-        with patch.object(engine, "_prepare_workspace", return_value=workspace):
-            engine.run(sample_task, tmp_path / "ws")
+    # P1-B: acquire_lease() is the authority — returns FAILED execution, not RuntimeError.
+    with patch.object(engine, "_prepare_workspace", return_value=workspace):
+        blocked = engine.run(sample_task, tmp_path / "ws")
 
-    # The existing lease is still held
+    assert blocked.status == ExecutionStatus.FAILED
+    assert blocked.error is not None
+    assert "lease" in blocked.error.lower()
+
+    # The existing lease is still held — the blocking execution still owns the workspace.
     active = tmp_db.get_active_lease(workspace)
     assert active is not None
     assert active.execution_id == existing_exec.execution_id

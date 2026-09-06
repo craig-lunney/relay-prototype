@@ -133,6 +133,13 @@ class StateManager:
             CREATE INDEX IF NOT EXISTS idx_events_sequence  ON events(sequence);
             CREATE INDEX IF NOT EXISTS idx_executions_task  ON executions(task_id);
             CREATE INDEX IF NOT EXISTS idx_leases_workspace ON execution_leases(workspace, released);
+
+            -- P1-B: enforce at-most-one active lease per workspace at the database level.
+            -- A partial UNIQUE index covers only released=0 rows, so historical
+            -- released=1 rows for the same workspace accumulate without constraint.
+            -- sqlite3.IntegrityError on INSERT is the authoritative failure signal.
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_leases_workspace_active
+                ON execution_leases(workspace) WHERE released=0;
         """)
         conn.commit()
 
@@ -181,19 +188,51 @@ class StateManager:
         error: str | None = None,
         validate_transition: bool = True,
     ) -> None:
-        if validate_transition:
-            task = self.get_task(task_id)
-            if task is not None:
-                allowed = ALLOWED_TRANSITIONS.get(task.status, frozenset())
-                if new_status not in allowed:
-                    raise InvalidTransitionError(
-                        f"Transition {task.status.value} → {new_status.value} is not allowed."
-                    )
-        self._conn().execute(
-            "UPDATE tasks SET status=?, error=?, updated_at=? WHERE task_id=?",
-            (new_status.value, error, _now_iso(), task_id),
-        )
-        self._conn().commit()
+        conn = self._conn()
+        if not validate_transition:
+            conn.execute(
+                "UPDATE tasks SET status=?, error=?, updated_at=? WHERE task_id=?",
+                (new_status.value, error, _now_iso(), task_id),
+            )
+            conn.commit()
+            return
+
+        # P1-B: atomic validate-then-update via CAS (compare-and-swap).
+        # Read the current status first, validate the transition, then UPDATE
+        # using WHERE ... AND status=<current> so that a concurrent writer
+        # changing the status between our read and our UPDATE will cause
+        # rowcount=0, which we detect as a concurrent-modification error.
+        # This prevents two concurrent writers from both validating against
+        # stale state and producing an impossible transition.
+        row = conn.execute(
+            "SELECT status FROM tasks WHERE task_id=?", (task_id,)
+        ).fetchone()
+
+        if row is not None:
+            current = TaskStatus(row["status"])
+            allowed = ALLOWED_TRANSITIONS.get(current, frozenset())
+            if new_status not in allowed:
+                raise InvalidTransitionError(
+                    f"Transition {current.value} → {new_status.value} is not allowed."
+                )
+            cursor = conn.execute(
+                "UPDATE tasks SET status=?, error=?, updated_at=? "
+                "WHERE task_id=? AND status=?",
+                (new_status.value, error, _now_iso(), task_id, current.value),
+            )
+            conn.commit()
+            if cursor.rowcount == 0:
+                raise InvalidTransitionError(
+                    f"Concurrent modification: task {task_id} status changed "
+                    f"during transition {current.value} → {new_status.value}. "
+                    "Another writer committed first."
+                )
+        else:
+            conn.execute(
+                "UPDATE tasks SET status=?, error=?, updated_at=? WHERE task_id=?",
+                (new_status.value, error, _now_iso(), task_id),
+            )
+            conn.commit()
 
     def increment_attempt_count(self, task_id: str) -> None:
         self._conn().execute(
@@ -309,29 +348,35 @@ class StateManager:
     # ── Leases ────────────────────────────────────────────────────────────────
 
     def acquire_lease(self, lease: ExecutionLease) -> bool:
-        """Atomically acquire a workspace lease. Returns False if already held."""
+        """Acquire a workspace lease. Returns False if the workspace is already leased.
+
+        P1-B: atomicity is enforced by the UNIQUE partial index
+        idx_leases_workspace_active ON execution_leases(workspace) WHERE released=0.
+        The INSERT either succeeds (we own the lease) or raises IntegrityError
+        (another active lease exists for this workspace). There is no SELECT
+        preliminary check — the database constraint is the sole authority.
+        Two concurrent callers cannot both receive True for the same workspace.
+        """
         conn = self._conn()
-        existing = conn.execute(
-            "SELECT execution_id FROM execution_leases WHERE workspace=? AND released=0",
-            (lease.workspace,),
-        ).fetchone()
-        if existing:
+        try:
+            conn.execute(
+                """
+                INSERT INTO execution_leases
+                    (execution_id, task_id, workspace, pid, started_at, expires_at,
+                     worker_identity, released)
+                VALUES (?,?,?,?,?,?,?,0)
+                """,
+                (
+                    lease.execution_id, lease.task_id, lease.workspace, lease.pid,
+                    lease.started_at.isoformat(), lease.expires_at.isoformat(),
+                    lease.worker_identity,
+                ),
+            )
+            conn.commit()
+            return True
+        except sqlite3.IntegrityError:
+            conn.rollback()
             return False
-        conn.execute(
-            """
-            INSERT INTO execution_leases
-                (execution_id, task_id, workspace, pid, started_at, expires_at,
-                 worker_identity, released)
-            VALUES (?,?,?,?,?,?,?,0)
-            """,
-            (
-                lease.execution_id, lease.task_id, lease.workspace, lease.pid,
-                lease.started_at.isoformat(), lease.expires_at.isoformat(),
-                lease.worker_identity,
-            ),
-        )
-        conn.commit()
-        return True
 
     def release_lease(self, execution_id: str) -> None:
         self._conn().execute(
@@ -350,6 +395,14 @@ class StateManager:
     def get_all_active_leases(self) -> list[ExecutionLease]:
         rows = self._conn().execute(
             "SELECT * FROM execution_leases WHERE released=0"
+        ).fetchall()
+        return [self._row_to_lease(r) for r in rows]
+
+    def get_active_leases_for_task(self, task_id: str) -> list[ExecutionLease]:
+        """Return all active (unreleased) leases associated with a task."""
+        rows = self._conn().execute(
+            "SELECT * FROM execution_leases WHERE task_id=? AND released=0",
+            (task_id,),
         ).fetchall()
         return [self._row_to_lease(r) for r in rows]
 

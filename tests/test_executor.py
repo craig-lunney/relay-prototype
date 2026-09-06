@@ -44,7 +44,12 @@ def test_prepare_workspace_overwrites_stale_copy(tmp_db, audit, policy, sample_t
 # ── Concurrent lease prevention ───────────────────────────────────────────────
 
 def test_second_execution_blocked_by_active_lease(tmp_db, audit, policy, sample_task, tmp_path):
-    """Two executions cannot run on the same workspace simultaneously."""
+    """Two executions cannot run on the same workspace simultaneously.
+
+    P1-B: the failure mode changed from RuntimeError (preliminary check) to a
+    clean FAILED execution (acquire_lease is now the authoritative gate). The
+    invariant — at most one execution per workspace — is unchanged.
+    """
     engine = _make_engine(tmp_db, audit, policy)
     workspace = engine._prepare_workspace(sample_task, tmp_path / "ws")
 
@@ -74,11 +79,24 @@ def test_second_execution_blocked_by_active_lease(tmp_db, audit, policy, sample_
     )
     tmp_db.acquire_lease(lease)
 
-    # Attempt a second run on the same workspace
-    with pytest.raises(RuntimeError, match="active lease"):
-        # We need to mock _prepare_workspace to return the same workspace
-        with patch.object(engine, "_prepare_workspace", return_value=workspace):
-            engine.run(sample_task, tmp_path / "ws")
+    # Attempt a second run on the same workspace.
+    # P1-B: acquire_lease() is now the authority — no preliminary check.
+    # The blocked execution is returned as FAILED (not raised as RuntimeError).
+    with patch.object(engine, "_prepare_workspace", return_value=workspace):
+        blocked = engine.run(sample_task, tmp_path / "ws")
+
+    assert blocked.status == ExecutionStatus.FAILED
+    assert blocked.error is not None
+    assert "lease" in blocked.error.lower()
+
+    # The original lease remains intact — the blocking execution still owns it.
+    active = tmp_db.get_active_lease(workspace)
+    assert active is not None
+    assert active.execution_id == ex.execution_id
+
+    # Claude was not invoked (no attempt_count increment).
+    reloaded = tmp_db.get_task(sample_task.task_id)
+    assert reloaded.attempt_count == 0
 
 
 # ── Max attempts ──────────────────────────────────────────────────────────────
