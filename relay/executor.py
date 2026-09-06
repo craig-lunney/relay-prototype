@@ -68,6 +68,76 @@ def _find_claude() -> str:
     return "claude"  # let subprocess raise FileNotFoundError with a clear message
 
 
+# ── Worker environment hardening (P1-G) ───────────────────────────────────────
+# Explicit allowlists: only variables on the platform list may be copied from
+# the parent process into the Claude worker environment.  All other parent
+# variables — including any credential-bearing variables such as
+# ANTHROPIC_API_KEY, DATABASE_URL, RELAY_DB_PATH — are excluded by default.
+# The security property is "unknown = excluded", not "known-bad = excluded".
+
+_WORKER_ENV_ALLOWLIST_WINDOWS: frozenset[str] = frozenset({
+    "PATH",                    # Locate executables (Python, git, Claude CLI)
+    "PATHEXT",                 # Executable file extensions (.exe, .cmd, .bat)
+    "SYSTEMROOT",              # Windows system directory for DLL loading
+    "WINDIR",                  # Alias for SYSTEMROOT used by Windows APIs
+    "SYSTEMDRIVE",             # Drive root letter (e.g. "C:")
+    "TEMP",                    # Temporary file storage
+    "TMP",                     # Temporary file storage (legacy alias)
+    "USERPROFILE",             # User home — Claude Code stores auth/config here
+    "APPDATA",                 # %APPDATA%\Claude — Claude app config directory
+    "LOCALAPPDATA",            # %LOCALAPPDATA%\Claude — Claude local data
+    "HOMEDRIVE",               # Drive component of home path (e.g. "C:")
+    "HOMEPATH",                # Path component of home (e.g. "\\Users\\alice")
+    "COMPUTERNAME",            # Machine name (some Node.js internals require this)
+    "USERNAME",                # Login name (low-sensitivity, used by some tools)
+    "OS",                      # "Windows_NT" — used by Windows APIs
+    "COMSPEC",                 # cmd.exe path — subprocess fallback on Windows
+    "PROCESSOR_ARCHITECTURE",  # CPU architecture (native module compatibility)
+})
+
+_WORKER_ENV_ALLOWLIST_POSIX: frozenset[str] = frozenset({
+    "PATH",            # Locate executables
+    "HOME",            # User home directory — Claude Code stores auth/config here
+    "USER",            # Username (POSIX)
+    "LOGNAME",         # Username (POSIX login name)
+    "SHELL",           # Default shell (subprocess fallbacks)
+    "TERM",            # Terminal type
+    "LANG",            # System locale
+    "LC_ALL",          # Locale override
+    "LC_CTYPE",        # Character classification locale
+    "TMPDIR",          # Temp directory (macOS/POSIX convention)
+    "TEMP",            # Temp directory
+    "TMP",             # Temp directory
+    "XDG_CONFIG_HOME", # XDG base directory for config
+    "XDG_DATA_HOME",   # XDG base directory for data
+    "XDG_RUNTIME_DIR", # XDG runtime directory
+})
+
+
+def _worker_environment() -> dict[str, str]:
+    """
+    Construct a minimal curated environment for the Claude worker subprocess.
+
+    Security property: parent-process variables are excluded by default.
+    Only variables present in the platform allowlist are copied from
+    os.environ.  Credential-bearing variables (ANTHROPIC_API_KEY,
+    DATABASE_URL, etc.) and any arbitrary variables not on the list are
+    excluded without any special-casing — the allowlist is the complete
+    definition of what may cross the Relay → worker boundary.
+    """
+    allowlist = (
+        _WORKER_ENV_ALLOWLIST_WINDOWS
+        if sys.platform == "win32"
+        else _WORKER_ENV_ALLOWLIST_POSIX
+    )
+    env: dict[str, str] = {}
+    for key in allowlist:
+        value = os.environ.get(key)
+        if value is not None:
+            env[key] = value
+    return env
+
+
 class ExecutionEngine:
     def __init__(
         self,
@@ -264,6 +334,7 @@ class ExecutionEngine:
                 text=True,
                 encoding="utf-8",
                 errors="replace",
+                env=_worker_environment(),  # P1-G: explicit curated env; never inherit parent
             )
             try:
                 out, err = proc.communicate(timeout=timeout_seconds)
