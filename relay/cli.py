@@ -50,12 +50,13 @@ def cmd_create_task(args) -> None:
         requested_actions=task_def.get("requested_actions", []),
         forbidden_actions=task_def.get("forbidden_actions", []),
         required_tests=task_def.get("required_tests", []),
+        expected_deleted_tests=task_def.get("expected_deleted_tests", []),
         approval_policy=task_def.get("approval_policy", "auto"),
         status=TaskStatus.CREATED,
     )
 
     state.create_task(task)
-    audit.task_created(task.task_id, task.project_id, task.repository)
+    audit.task_created_with_hash(task)
 
     state.update_task_status(task.task_id, TaskStatus.VALIDATING)
 
@@ -108,53 +109,87 @@ def cmd_run_task(args) -> None:
     execution = engine.run(task, workspace_base, timeout_seconds=args.timeout)
     print(f"Execution {execution.execution_id}: {execution.status.value}")
 
-    if execution.status.value in ("COMPLETED", "FAILED"):
-        state.update_task_status(
-            task.task_id, TaskStatus.VERIFYING, validate_transition=True
-        )
-        audit.verification_started(task.task_id, execution.execution_id)
+    # The discriminator for whether the worker process was actually launched.
+    # exit_code is only set by proc.returncode or -1 on timeout; it stays None
+    # for every pre-launch failure (approval denied, lease held, auth error, CLI
+    # not found). This is the sole gate determining whether verification is valid.
+    worker_ran = execution.exit_code is not None
 
-        result = verifier.verify(task, execution)
-        audit.verification_completed(
-            task.task_id, execution.execution_id, result.passed, result.as_dict()
-        )
-
-        if result.passed:
+    # P1-J: outer finally releases the workspace lease regardless of outcome
+    # (verification success, verification failure, timeout, pre-launch failure).
+    # The lease is held by engine.run() through the end of execution and released
+    # here — never inside the individual branches.
+    try:
+        if execution.status.value == "COMPLETED" or (execution.status.value == "FAILED" and worker_ran):
+            # P1-J: lease is held through verification to prevent a concurrent
+            # execution from acquiring the workspace between worker exit and
+            # verification completion.
             state.update_task_status(
-                task.task_id, TaskStatus.COMPLETED, validate_transition=True
+                task.task_id, TaskStatus.VERIFYING, validate_transition=True
             )
-            audit.task_completed(task.task_id)
-            print(f"Task {task.task_id}: COMPLETED (independently verified)")
-            # H-2: clean up workspace after successful verification, unless
-            # operator requested it be kept for inspection.
-            if not keep_workspace and execution.workspace:
-                engine.cleanup_workspace(execution.workspace, workspace_base)
-        else:
-            reason = f"Verification failed. Errors: {result.errors}"
+            audit.verification_started(task.task_id, execution.execution_id)
+
+            result = verifier.verify(task, execution)
+            audit.verification_completed(
+                task.task_id, execution.execution_id, result.passed, result.as_dict()
+            )
+
+            if result.passed:
+                state.update_task_status(
+                    task.task_id, TaskStatus.COMPLETED, validate_transition=True
+                )
+                audit.task_completed(task.task_id)
+                print(f"Task {task.task_id}: COMPLETED (independently verified)")
+                # H-2: clean up workspace after successful verification, unless
+                # operator requested it be kept for inspection.
+                if not keep_workspace and execution.workspace:
+                    engine.cleanup_workspace(execution.workspace, workspace_base)
+            else:
+                reason = f"Verification failed. Errors: {result.errors}"
+                state.update_task_status(
+                    task.task_id, TaskStatus.FAILED, error=reason, validate_transition=True
+                )
+                audit.task_failed(task.task_id, reason)
+                # H-2: clean up workspace even on verification failure; the failed
+                # state is recorded in the DB and audit log.
+                if not keep_workspace and execution.workspace:
+                    engine.cleanup_workspace(execution.workspace, workspace_base)
+                print(f"Task {task.task_id}: FAILED — {reason}", file=sys.stderr)
+                sys.exit(1)
+
+        elif execution.status.value == "FAILED":
+            # Pre-launch failure: the worker was never launched (exit_code is None).
+            # Verifying the unchanged baseline workspace could produce a false
+            # TASK_COMPLETED if the existing tests already pass. Fail unconditionally.
+            # P1-J: READY→FAILED is now in ALLOWED_TRANSITIONS, so validate_transition=True
+            # is correct for both READY and RUNNING pre-launch failure paths.
+            reason = execution.error or "Worker was not launched."
             state.update_task_status(
                 task.task_id, TaskStatus.FAILED, error=reason, validate_transition=True
             )
             audit.task_failed(task.task_id, reason)
-            # H-2: clean up workspace even on verification failure; the failed
-            # state is recorded in the DB and audit log.
             if not keep_workspace and execution.workspace:
                 engine.cleanup_workspace(execution.workspace, workspace_base)
             print(f"Task {task.task_id}: FAILED — {reason}", file=sys.stderr)
             sys.exit(1)
 
-    elif execution.status.value == "TIMEOUT":
-        state.update_task_status(
-            task.task_id, TaskStatus.TIMEOUT, validate_transition=True
-        )
-        audit.execution_timeout(
-            task.task_id, execution.execution_id, args.timeout
-        )
-        # H-2: clean up workspace after timeout; no recovery is in progress
-        # at this point (the lease was released by the executor).
-        if not keep_workspace and execution.workspace:
-            engine.cleanup_workspace(execution.workspace, workspace_base)
-        print(f"Task {task.task_id}: TIMEOUT", file=sys.stderr)
-        sys.exit(1)
+        elif execution.status.value == "TIMEOUT":
+            state.update_task_status(
+                task.task_id, TaskStatus.TIMEOUT, validate_transition=True
+            )
+            audit.execution_timeout(
+                task.task_id, execution.execution_id, args.timeout
+            )
+            # H-2: clean up workspace after timeout; the lease is released by
+            # the outer finally block.
+            if not keep_workspace and execution.workspace:
+                engine.cleanup_workspace(execution.workspace, workspace_base)
+            print(f"Task {task.task_id}: TIMEOUT", file=sys.stderr)
+            sys.exit(1)
+
+    finally:
+        if execution.workspace:
+            engine.release_workspace_lease(execution.execution_id)
 
 
 def cmd_approve_task(args) -> None:

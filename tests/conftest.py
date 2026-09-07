@@ -9,12 +9,52 @@ from pathlib import Path
 import pytest
 
 from relay.audit import AuditLog
+from relay.executor import ExecutionEngine
 from relay.models import Task, TaskStatus
 from relay.policy import PolicyEngine
 from relay.state import StateManager
 
 # Absolute path to the disposable test repository.
 TEST_REPO_SRC = Path(__file__).parent.parent / "test-repository"
+
+# Fake key used across all tests — never a real credential.
+_FAKE_API_KEY = "sk-ant-test-fake-key-do-not-use-in-production"
+
+
+@pytest.fixture(autouse=True)
+def _no_op_checkout_and_baseline(monkeypatch):
+    """Suppress P1-J best-effort pre-flight operations in all unit tests.
+
+    _checkout_base_ref and _capture_baseline both call subprocess.Popen.
+    Tests that mock subprocess.Popen to inspect Claude's invocation command
+    would otherwise see git/pytest calls at call_args_list[0] and [1],
+    shifting the index of the Claude call.  These operations are best-effort
+    and are covered by dedicated P1-J tests; suppress them globally so all
+    other tests see the Claude Popen call at index 0 as before P1-J.
+    """
+    monkeypatch.setattr(
+        ExecutionEngine, "_checkout_base_ref",
+        lambda self, base_ref, workspace: None,
+    )
+    monkeypatch.setattr(
+        ExecutionEngine, "_capture_baseline",
+        lambda self, task, execution, workspace: None,
+    )
+
+
+@pytest.fixture(autouse=True)
+def _relay_api_key_file(tmp_path, monkeypatch):
+    """Provide RELAY_API_KEY_FILE for every test that exercises executor code.
+
+    Tests that specifically test the missing-env-var failure path should call
+    monkeypatch.delenv("RELAY_API_KEY_FILE", raising=False) after this fixture
+    runs (fixtures run before the test body, so delenv in the test body removes
+    what this fixture set).
+    """
+    key_file = tmp_path / "fake_relay_api_key.txt"
+    key_file.write_text(_FAKE_API_KEY, encoding="ascii")
+    monkeypatch.setenv("RELAY_API_KEY_FILE", str(key_file))
+    return key_file
 
 
 def _git(*args, cwd, **kwargs):

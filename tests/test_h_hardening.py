@@ -236,7 +236,7 @@ def _make_spy_popen(report_json: dict | None = None, exit_code: int = 0, timeout
         proc = MagicMock()
         if timeout:
             call_count = [0]
-            def communicate(timeout=None):
+            def communicate(timeout=None, input=None):
                 call_count[0] += 1
                 if call_count[0] == 1:
                     raise subprocess.TimeoutExpired(cmd, timeout or 1)

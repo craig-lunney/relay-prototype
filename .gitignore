@@ -7,3 +7,4 @@ build/
 *.db
 workspaces/
 relay.db
+relay_worker_api_key.txt

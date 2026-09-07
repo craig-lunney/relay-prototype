@@ -129,6 +129,12 @@ def validate_test_specifier(specifier: str, workspace: str | Path | None = None)
                 f"is outside the authorised workspace: {exc}"
             ) from exc
 
+    if "\\" in specifier:
+        raise InvalidTestSpecifierError(
+            f"Test specifier {specifier!r} contains a backslash. "
+            "Use forward slashes for path separators in test specifiers."
+        )
+
     return specifier
 
 

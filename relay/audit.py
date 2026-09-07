@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from datetime import datetime, timezone
 from typing import Any
 
-from .models import AuditEvent, AuditEventType
+from .models import AuditEvent, AuditEventType, Task
 from .state import StateManager
 
 # Only Relay writes authoritative audit events. Workers have no path to this module.
@@ -42,6 +44,32 @@ class AuditLog:
         return self._emit(AuditEventType.TASK_CREATED, task_id, {
             "project_id": project_id,
             "repository": repository,
+        })
+
+    def task_created_with_hash(self, task: Task) -> AuditEvent:
+        """P1-J: emit TASK_CREATED with a content_hash binding task content to its ID.
+
+        content_hash is SHA-256 of the JSON-serialised content fields in
+        canonical (sorted-key) form. It binds task identity to content at
+        creation time for audit trail integrity. It is not a security control —
+        the DB is the authoritative source; the hash is diagnostic evidence.
+        """
+        content = {
+            "objective": task.objective,
+            "requirements": task.requirements,
+            "acceptance_criteria": task.acceptance_criteria,
+            "requested_actions": task.requested_actions,
+            "forbidden_actions": task.forbidden_actions,
+            "required_tests": task.required_tests,
+            "expected_deleted_tests": task.expected_deleted_tests,
+            "base_ref": task.base_ref,
+        }
+        blob = json.dumps(content, sort_keys=True, ensure_ascii=True)
+        content_hash = hashlib.sha256(blob.encode()).hexdigest()
+        return self._emit(AuditEventType.TASK_CREATED, task.task_id, {
+            "project_id": task.project_id,
+            "repository": task.repository,
+            "content_hash": content_hash,
         })
 
     def task_validated(self, task_id: str) -> AuditEvent:

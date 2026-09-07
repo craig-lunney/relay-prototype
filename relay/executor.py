@@ -138,6 +138,63 @@ def _worker_environment() -> dict[str, str]:
     return env
 
 
+def _build_auth_settings() -> tuple[list[str], None] | tuple[None, str]:
+    """
+    Return (['--settings', json_value], None) when RELAY_API_KEY_FILE is configured
+    and points to a readable file, or (None, error_message) on any failure.
+
+    Reads RELAY_API_KEY_FILE from the parent (operator) environment only.
+    The variable and the key it references never enter the worker subprocess environment.
+    The returned json_value contains an apiKeyHelper command that reads the key file
+    at runtime — raw key material is never embedded in the command or in Relay's code.
+
+    Fails closed: callers must not proceed if this returns (None, error_message).
+    """
+    raw = os.environ.get("RELAY_API_KEY_FILE", "")
+    if not raw:
+        return None, (
+            "RELAY_API_KEY_FILE is not set. "
+            "Set it to the path of the Anthropic API key file before running relay. "
+            "Claude cannot authenticate without it."
+        )
+
+    try:
+        key_path = Path(raw).resolve()
+    except (OSError, ValueError) as exc:
+        return None, f"RELAY_API_KEY_FILE contains an invalid path ({exc})."
+
+    if not key_path.is_file():
+        return None, (
+            f"RELAY_API_KEY_FILE does not point to a readable file: {key_path}"
+        )
+
+    # The helper script lives in the relay package directory — not in the workspace,
+    # not in the worker_config directory, and not in the repository.
+    helper_script = Path(__file__).parent / "api_key_helper.py"
+    if not helper_script.is_file():
+        return None, (
+            f"Relay API key helper not found at {helper_script}. "
+            "This is a packaging error — ensure api_key_helper.py is present."
+        )
+
+    # Shell-safety: reject paths that contain double-quote characters.
+    # These cannot be safely embedded in a double-quoted shell argument, and
+    # canonical OS paths cannot legally contain them anyway.
+    for label, path_obj in (("API key file", key_path), ("helper script", helper_script)):
+        if '"' in str(path_obj):
+            return None, (
+                f"{label} path contains a double-quote character and cannot be "
+                f"safely embedded in the apiKeyHelper command: {path_obj}"
+            )
+
+    # sys.executable is the same interpreter running this relay process — guaranteed
+    # to be on the curated PATH and to have access to the relay package.
+    # Each component is double-quoted to handle spaces in any path segment.
+    helper_cmd = f'"{sys.executable}" "{helper_script}" "{key_path}"'
+
+    return ["--settings", _json.dumps({"apiKeyHelper": helper_cmd})], None
+
+
 class ExecutionEngine:
     def __init__(
         self,
@@ -148,6 +205,16 @@ class ExecutionEngine:
         self._state = state
         self._audit = audit
         self._policy = policy
+
+    def release_workspace_lease(self, execution_id: str) -> None:
+        """Release the workspace lease held for execution_id.
+
+        P1-J: lease release is the responsibility of the caller (cmd_run_task)
+        so that the workspace remains owned through the full verification pass.
+        This method is the single release point — do not call
+        self._state.release_lease() directly from within run().
+        """
+        self._state.release_lease(execution_id)
 
     def run(
         self,
@@ -202,7 +269,32 @@ class ExecutionEngine:
             self._audit.execution_blocked(task.task_id, exec_id, execution.error)
             return execution
 
-        workspace = self._prepare_workspace(task, workspace_base)
+        # P1-J: verify source repository is readable before preparing workspace.
+        self._check_source_repository(task)
+        try:
+            workspace = self._prepare_workspace(task, workspace_base)
+        except RuntimeError as exc:
+            # base_ref checkout failed — fail closed.
+            # Claude is never launched; exit_code remains None (pre-launch discriminator).
+            # No lease is acquired; attempt_count is not incremented.
+            exec_id = Execution.new_id()
+            now = datetime.now(timezone.utc)
+            execution = Execution(
+                execution_id=exec_id,
+                task_id=task.task_id,
+                attempt_number=task.attempt_count + 1,
+                status=ExecutionStatus.FAILED,
+                workspace="",
+                worker_identity=_worker_identity(),
+                policy_version=POLICY_VERSION,
+                capability_snapshot=[],
+                started_at=now,
+                ended_at=now,
+                error=str(exc),
+            )
+            self._state.create_execution(execution)
+            self._audit.execution_failed(task.task_id, exec_id, execution.error)
+            return execution
 
         # P1-C: verify the workspace is within the canonical workspace_base before
         # creating any state. Raises RuntimeError if boundary cannot be established.
@@ -278,16 +370,34 @@ class ExecutionEngine:
             task.task_id, exec_id, workspace, execution.attempt_number
         )
 
-        try:
-            self._invoke_claude(task, execution, workspace, timeout_seconds)
-        finally:
-            self._state.release_lease(exec_id)
+        # P1-J: baseline capture before Claude runs. Stores collected test IDs
+        # on the execution object so the verifier can detect test deletions.
+        self._capture_baseline(task, execution, workspace)
+
+        # P1-J: lease is NOT released here. cmd_run_task holds the lease through
+        # the full verification pass in its try/finally block, then calls
+        # release_workspace_lease(). This prevents a concurrent execution from
+        # acquiring the workspace between worker exit and verification completion.
+        self._invoke_claude(task, execution, workspace, timeout_seconds)
 
         self._state.update_execution(execution)
         return execution
 
+    def _check_source_repository(self, task: Task) -> None:
+        """Verify the task repository is a readable directory before workspace prep."""
+        repo = Path(task.repository)
+        if not repo.is_dir():
+            raise RuntimeError(
+                f"Task repository {task.repository!r} is not a readable directory."
+            )
+
     def _prepare_workspace(self, task: Task, workspace_base: str | Path) -> str:
-        """Copy the task repository into a fresh isolated workspace."""
+        """Copy the task repository into a fresh isolated workspace.
+
+        P1-J: after copy, check out task.base_ref in the workspace so the
+        worker always starts from the declared baseline state.
+        task.working_ref is stored metadata only and is never used operationally.
+        """
         # P1-C: resolve workspace_base to canonical form so the returned workspace
         # path is always absolute and free of .. / . / symlink indirection.
         base = Path(workspace_base).resolve()
@@ -296,7 +406,54 @@ class ExecutionEngine:
         if workspace.exists():
             shutil.rmtree(str(workspace), onerror=_rm_readonly)
         shutil.copytree(task.repository, str(workspace))
+        # P1-J: check out base_ref so the worker starts from the declared
+        # baseline commit regardless of which commit is current in the source.
+        self._checkout_base_ref(task.base_ref, str(workspace))
         return str(workspace)
+
+    def _checkout_base_ref(self, base_ref: str, workspace: str) -> None:
+        """Check out base_ref in the workspace copy. Raises RuntimeError on failure."""
+        try:
+            result = subprocess.run(
+                ["git", "checkout", base_ref],
+                cwd=workspace,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        except FileNotFoundError:
+            raise RuntimeError(
+                f"git not found; cannot check out base_ref {base_ref!r}."
+            )
+        except subprocess.TimeoutExpired:
+            raise RuntimeError(
+                f"git checkout {base_ref!r} timed out after 30 s."
+            )
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"git checkout {base_ref!r} failed (exit {result.returncode}): "
+                f"{result.stderr.strip()}"
+            )
+
+    def _capture_baseline(
+        self, task: Task, execution: Execution, workspace: str
+    ) -> None:
+        """Collect baseline test IDs before invoking Claude.
+
+        P1-J: the collected IDs are stored on the execution object and persisted
+        to the DB via update_execution at the end of run(). The verifier uses
+        them to detect test deletions and de-activations (SKIPPED/XFAILED).
+        Baseline collection failure produces an empty ID list, which causes
+        the verifier to fail closed on H-2 (must have collected at least one
+        test before Claude ran).
+        """
+        from .testing import collect_tests
+        exit_code, collected, raw_output, _errors = collect_tests(
+            workspace, task.required_tests, _worker_environment()
+        )
+        execution.baseline_tests_collected = collected
+        execution.baseline_test_exit = exit_code
+        execution.baseline_test_output = raw_output
 
     def cleanup_workspace(self, workspace: str, workspace_base: str | Path) -> None:
         """
@@ -344,14 +501,37 @@ class ExecutionEngine:
         claude_exe = _find_claude()
         worker_config = _ensure_worker_config()
 
+        # P1-I/Auth: build authentication settings before constructing the command.
+        # Fail closed immediately if auth cannot be configured — no subprocess is launched.
+        auth_flags, auth_error = _build_auth_settings()
+        if auth_error is not None:
+            execution.status = ExecutionStatus.FAILED
+            execution.error = f"Authentication not configured: {auth_error}"
+            execution.ended_at = datetime.now(timezone.utc)
+            self._audit.execution_failed(
+                task.task_id, execution.execution_id, execution.error
+            )
+            return
+
         cmd = [
             claude_exe,
             "--print",
             "--max-turns", "10",
             "--output-format", "json",
             "--bare",
+            # P1-I/Auth: deliver API key via apiKeyHelper; key never enters worker env.
+            *auth_flags,
+            # P1-I/Permissions: explicit tool allowlist.
+            # Narrows the worker to exactly the capabilities required for Prototype 0 tasks.
+            # This is NOT --dangerously-skip-permissions and NOT bypassPermissions.
+            # Only these four patterns are approved; everything else remains denied.
+            "--allowedTools", "Read Edit Bash(python -m pytest *) Bash(pytest *)",
             "--add-dir", str(worker_config),
-            prompt,
+            # P1-I/Fix1: Prompt is delivered via stdin (stdin=PIPE + communicate(input=)).
+            # Passing multi-line content as a positional command-line argument is unreliable
+            # on Windows: embedded newlines in argv are not preserved by CommandLineToArgvW,
+            # causing Claude Code to receive a truncated or empty prompt and fall back to
+            # "no stdin data received" mode.  stdin is the correct channel for --print mode.
         ]
 
         timed_out = False
@@ -359,6 +539,7 @@ class ExecutionEngine:
             proc = subprocess.Popen(
                 cmd,
                 cwd=workspace,
+                stdin=subprocess.PIPE,  # P1-I/Fix1: prompt delivered via stdin
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
@@ -367,7 +548,7 @@ class ExecutionEngine:
                 env=_worker_environment(),  # P1-G: explicit curated env; never inherit parent
             )
             try:
-                out, err = proc.communicate(timeout=timeout_seconds)
+                out, err = proc.communicate(input=prompt, timeout=timeout_seconds)
                 execution.stdout = out or ""
                 execution.stderr = err or ""
                 execution.exit_code = proc.returncode

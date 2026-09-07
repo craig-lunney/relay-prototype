@@ -58,43 +58,47 @@ class StateManager:
         conn = self._conn()
         conn.executescript("""
             CREATE TABLE IF NOT EXISTS tasks (
-                task_id            TEXT PRIMARY KEY,
-                project_id         TEXT NOT NULL,
-                repository         TEXT NOT NULL,
-                base_ref           TEXT NOT NULL,
-                working_ref        TEXT NOT NULL,
-                objective          TEXT NOT NULL,
-                requirements       TEXT NOT NULL,
-                acceptance_criteria TEXT NOT NULL,
-                requested_actions  TEXT NOT NULL,
-                forbidden_actions  TEXT NOT NULL,
-                required_tests     TEXT NOT NULL,
-                approval_policy    TEXT NOT NULL,
-                status             TEXT NOT NULL,
-                protocol_version   TEXT NOT NULL DEFAULT '0.1',
+                task_id                TEXT PRIMARY KEY,
+                project_id             TEXT NOT NULL,
+                repository             TEXT NOT NULL,
+                base_ref               TEXT NOT NULL,
+                working_ref            TEXT NOT NULL,
+                objective              TEXT NOT NULL,
+                requirements           TEXT NOT NULL,
+                acceptance_criteria    TEXT NOT NULL,
+                requested_actions      TEXT NOT NULL,
+                forbidden_actions      TEXT NOT NULL,
+                required_tests         TEXT NOT NULL,
+                expected_deleted_tests TEXT NOT NULL DEFAULT '[]',
+                approval_policy        TEXT NOT NULL,
+                status                 TEXT NOT NULL,
+                protocol_version       TEXT NOT NULL DEFAULT '0.1',
                 max_execution_attempts INTEGER NOT NULL DEFAULT 3,
-                attempt_count      INTEGER NOT NULL DEFAULT 0,
-                error              TEXT,
-                created_at         TEXT NOT NULL,
-                updated_at         TEXT NOT NULL
+                attempt_count          INTEGER NOT NULL DEFAULT 0,
+                error                  TEXT,
+                created_at             TEXT NOT NULL,
+                updated_at             TEXT NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS executions (
-                execution_id       TEXT PRIMARY KEY,
-                task_id            TEXT NOT NULL REFERENCES tasks(task_id),
-                attempt_number     INTEGER NOT NULL,
-                status             TEXT NOT NULL,
-                workspace          TEXT NOT NULL,
-                worker_identity    TEXT NOT NULL,
-                policy_version     TEXT NOT NULL,
-                capability_snapshot TEXT NOT NULL,
-                started_at         TEXT NOT NULL,
-                ended_at           TEXT,
-                exit_code          INTEGER,
-                stdout             TEXT NOT NULL DEFAULT '',
-                stderr             TEXT NOT NULL DEFAULT '',
-                error              TEXT,
-                report             TEXT
+                execution_id              TEXT PRIMARY KEY,
+                task_id                   TEXT NOT NULL REFERENCES tasks(task_id),
+                attempt_number            INTEGER NOT NULL,
+                status                    TEXT NOT NULL,
+                workspace                 TEXT NOT NULL,
+                worker_identity           TEXT NOT NULL,
+                policy_version            TEXT NOT NULL,
+                capability_snapshot       TEXT NOT NULL,
+                started_at                TEXT NOT NULL,
+                ended_at                  TEXT,
+                exit_code                 INTEGER,
+                stdout                    TEXT NOT NULL DEFAULT '',
+                stderr                    TEXT NOT NULL DEFAULT '',
+                error                     TEXT,
+                report                    TEXT,
+                baseline_tests_collected  TEXT NOT NULL DEFAULT '[]',
+                baseline_test_exit        INTEGER,
+                baseline_test_output      TEXT NOT NULL DEFAULT ''
             );
 
             CREATE TABLE IF NOT EXISTS execution_leases (
@@ -142,6 +146,17 @@ class StateManager:
             CREATE UNIQUE INDEX IF NOT EXISTS idx_leases_workspace_active
                 ON execution_leases(workspace) WHERE released=0;
         """)
+        # P1-J: migrate existing databases that pre-date these columns.
+        for stmt in (
+            "ALTER TABLE tasks ADD COLUMN expected_deleted_tests TEXT NOT NULL DEFAULT '[]'",
+            "ALTER TABLE executions ADD COLUMN baseline_tests_collected TEXT NOT NULL DEFAULT '[]'",
+            "ALTER TABLE executions ADD COLUMN baseline_test_exit INTEGER",
+            "ALTER TABLE executions ADD COLUMN baseline_test_output TEXT NOT NULL DEFAULT ''",
+        ):
+            try:
+                conn.execute(stmt)
+            except sqlite3.OperationalError:
+                pass  # column already exists
         conn.commit()
 
     # ── Tasks ─────────────────────────────────────────────────────────────────
@@ -154,10 +169,10 @@ class StateManager:
                 task_id, project_id, repository, base_ref, working_ref,
                 objective, requirements, acceptance_criteria,
                 requested_actions, forbidden_actions, required_tests,
-                approval_policy, status, protocol_version,
+                expected_deleted_tests, approval_policy, status, protocol_version,
                 max_execution_attempts, attempt_count, error,
                 created_at, updated_at
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 task.task_id, task.project_id, task.repository,
@@ -167,6 +182,7 @@ class StateManager:
                 json.dumps(task.requested_actions),
                 json.dumps(task.forbidden_actions),
                 json.dumps(task.required_tests),
+                json.dumps(task.expected_deleted_tests),
                 task.approval_policy, task.status.value,
                 task.protocol_version, task.max_execution_attempts,
                 task.attempt_count, task.error,
@@ -255,6 +271,7 @@ class StateManager:
             requested_actions=json.loads(row["requested_actions"]),
             forbidden_actions=json.loads(row["forbidden_actions"]),
             required_tests=json.loads(row["required_tests"]),
+            expected_deleted_tests=json.loads(row["expected_deleted_tests"] or "[]"),
             approval_policy=row["approval_policy"],
             status=TaskStatus(row["status"]),
             protocol_version=row["protocol_version"],
@@ -274,8 +291,9 @@ class StateManager:
             INSERT INTO executions (
                 execution_id, task_id, attempt_number, status, workspace,
                 worker_identity, policy_version, capability_snapshot,
-                started_at, ended_at, exit_code, stdout, stderr, error, report
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                started_at, ended_at, exit_code, stdout, stderr, error, report,
+                baseline_tests_collected, baseline_test_exit, baseline_test_output
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 execution.execution_id, execution.task_id, execution.attempt_number,
@@ -286,6 +304,9 @@ class StateManager:
                 execution.exit_code, execution.stdout, execution.stderr,
                 execution.error,
                 json.dumps(execution.report.to_dict()) if execution.report else None,
+                json.dumps(execution.baseline_tests_collected),
+                execution.baseline_test_exit,
+                execution.baseline_test_output,
             ),
         )
         conn.commit()
@@ -294,7 +315,8 @@ class StateManager:
         self._conn().execute(
             """
             UPDATE executions SET
-                status=?, ended_at=?, exit_code=?, stdout=?, stderr=?, error=?, report=?
+                status=?, ended_at=?, exit_code=?, stdout=?, stderr=?, error=?, report=?,
+                baseline_tests_collected=?, baseline_test_exit=?, baseline_test_output=?
             WHERE execution_id=?
             """,
             (
@@ -303,6 +325,9 @@ class StateManager:
                 execution.exit_code, execution.stdout, execution.stderr,
                 execution.error,
                 json.dumps(execution.report.to_dict()) if execution.report else None,
+                json.dumps(execution.baseline_tests_collected),
+                execution.baseline_test_exit,
+                execution.baseline_test_output,
                 execution.execution_id,
             ),
         )
@@ -344,6 +369,9 @@ class StateManager:
             stderr=row["stderr"] or "",
             error=row["error"],
             report=report,
+            baseline_tests_collected=json.loads(row["baseline_tests_collected"] or "[]"),
+            baseline_test_exit=row["baseline_test_exit"],
+            baseline_test_output=row["baseline_test_output"] or "",
         )
 
     # ── Leases ────────────────────────────────────────────────────────────────

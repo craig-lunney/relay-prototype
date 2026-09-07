@@ -138,7 +138,7 @@ def test_sec9_timeout_recorded_correctly(tmp_db, audit, policy, sample_task, tmp
         proc = MagicMock()
         call_count = [0]
 
-        def communicate(timeout=None):
+        def communicate(timeout=None, input=None):
             call_count[0] += 1
             if call_count[0] == 1:
                 raise subprocess.TimeoutExpired(args[0] if args else "cmd", timeout or 1)
@@ -227,6 +227,12 @@ def test_sec12_completed_assertion_requires_verification(tmp_db, audit, policy, 
     Claude says COMPLETED in its report.
     Relay must not accept this without running the verifier independently.
     """
+    # Inject a controlled failure into the repository so the workspace copy will also
+    # have failing tests — letting us verify that Relay catches a false COMPLETED claim.
+    from pathlib import Path
+    calc = Path(sample_task.repository) / "calculator.py"
+    calc.write_text(calc.read_text(encoding="utf-8").replace("return a + b", "return a + b + 999"), encoding="utf-8")
+
     false_completed_report = {
         "protocol_version": "0.1",
         "message_type": "IMPLEMENTATION_REPORT",

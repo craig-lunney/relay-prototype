@@ -38,8 +38,9 @@ _TASK_INPUT_SCHEMA: dict[str, Any] = {
         "acceptance_criteria": {"type": list, "items": str},
         "requested_actions":   {"type": list, "items": str},
         "forbidden_actions":   {"type": list, "items": str},
-        "required_tests":      {"type": list, "items": str},
-        "approval_policy":     {"type": str, "enum": frozenset({"auto", "manual"})},
+        "required_tests":           {"type": list, "items": str},
+        "expected_deleted_tests":   {"type": list, "items": str},
+        "approval_policy":          {"type": str, "enum": frozenset({"auto", "manual"})},
     },
 }
 

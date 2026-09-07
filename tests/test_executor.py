@@ -125,7 +125,7 @@ def _make_timeout_popen(*args, **kwargs):
     proc = MagicMock()
     call_count = [0]
 
-    def communicate(timeout=None):
+    def communicate(timeout=None, input=None):
         call_count[0] += 1
         if call_count[0] == 1:
             raise subprocess.TimeoutExpired(args[0] if args else "cmd", timeout or 1)
@@ -175,21 +175,27 @@ def test_timeout_ceiling_enforced(tmp_db, audit, policy, sample_task, tmp_path):
     engine = _make_engine(tmp_db, audit, policy)
 
     captured_timeout = []
-    call_tracker = [0]
 
     def mock_popen(*args, **kwargs):
         proc = MagicMock()
-        def communicate(timeout=None):
-            call_tracker[0] += 1
-            if call_tracker[0] == 1:
+        proc.returncode = -1
+        call_n = [0]
+        def communicate(timeout=None, input=None):
+            call_n[0] += 1
+            if call_n[0] == 1:
+                # First call: simulate timeout and capture the clamped value.
                 captured_timeout.append(timeout)
                 raise subprocess.TimeoutExpired("cmd", timeout)
+            # Second call (after proc.kill()): return normally.
             return ("", "")
         proc.communicate.side_effect = communicate
         return proc
 
+    # Patch out _capture_baseline so the Popen mock is only consumed by
+    # _invoke_claude, keeping the call-count deterministic.
     with patch("subprocess.Popen", side_effect=mock_popen):
-        engine.run(sample_task, tmp_path / "ws", timeout_seconds=99999)
+        with patch.object(engine, "_capture_baseline"):
+            engine.run(sample_task, tmp_path / "ws", timeout_seconds=99999)
 
     assert captured_timeout[0] <= MAX_TIMEOUT_SECONDS
 
@@ -258,6 +264,9 @@ def test_failed_execution_preserves_stdout_stderr(tmp_db, audit, policy, sample_
 # ── Lease lifecycle ───────────────────────────────────────────────────────────
 
 def test_lease_released_after_successful_execution(tmp_db, audit, policy, sample_task, tmp_path):
+    # P1-J: engine.run() now holds the lease through the end of execution so
+    # that cmd_run_task can keep it held through verification. The lease is
+    # released only after release_workspace_lease() is called explicitly.
     report = {
         "protocol_version": "0.1",
         "message_type": "IMPLEMENTATION_REPORT",
@@ -273,15 +282,27 @@ def test_lease_released_after_successful_execution(tmp_db, audit, policy, sample
     with patch("subprocess.Popen", side_effect=_make_success_popen(report)):
         execution = engine.run(sample_task, tmp_path / "ws")
 
-    # Lease should be released even after successful completion
+    # Lease is still held after engine.run() — held for verification.
+    active = tmp_db.get_active_lease(execution.workspace)
+    assert active is not None
+
+    # Explicit release clears the lease.
+    engine.release_workspace_lease(execution.execution_id)
     active = tmp_db.get_active_lease(execution.workspace)
     assert active is None
 
 
 def test_lease_released_after_timeout(tmp_db, audit, policy, sample_task, tmp_path):
+    # P1-J: same as above — lease held through engine.run(), released explicitly.
     engine = _make_engine(tmp_db, audit, policy)
     with patch("subprocess.Popen", side_effect=_make_timeout_popen):
         execution = engine.run(sample_task, tmp_path / "ws", timeout_seconds=1)
 
+    # Lease is still held after engine.run().
+    active = tmp_db.get_active_lease(execution.workspace)
+    assert active is not None
+
+    # Explicit release clears the lease.
+    engine.release_workspace_lease(execution.execution_id)
     active = tmp_db.get_active_lease(execution.workspace)
     assert active is None

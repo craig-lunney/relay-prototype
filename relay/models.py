@@ -59,7 +59,8 @@ class AuditEventType(str, Enum):
 ALLOWED_TRANSITIONS: dict[TaskStatus, frozenset[TaskStatus]] = {
     TaskStatus.CREATED:           frozenset({TaskStatus.VALIDATING, TaskStatus.CANCELLED}),
     TaskStatus.VALIDATING:        frozenset({TaskStatus.READY, TaskStatus.REJECTED, TaskStatus.BLOCKED}),
-    TaskStatus.READY:             frozenset({TaskStatus.RUNNING, TaskStatus.CANCELLED}),
+    TaskStatus.READY:             frozenset({TaskStatus.RUNNING, TaskStatus.CANCELLED,
+                                             TaskStatus.FAILED}),
     TaskStatus.RUNNING:           frozenset({TaskStatus.VERIFYING, TaskStatus.FAILED,
                                              TaskStatus.TIMEOUT, TaskStatus.RECOVERY_REQUIRED}),
     TaskStatus.VERIFYING:         frozenset({TaskStatus.COMPLETED, TaskStatus.FAILED}),
@@ -89,6 +90,9 @@ class Task:
     forbidden_actions: list[str]
     required_tests: list[str]
     approval_policy: str
+    # P1-J: authorised deletions within required_tests scope (operator-declared).
+    # Prevents false-failure when a task legitimately removes a test.
+    expected_deleted_tests: list[str] = field(default_factory=list)
     status: TaskStatus = TaskStatus.CREATED
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
@@ -130,6 +134,10 @@ class Execution:
     stderr: str = ""
     error: str | None = None
     report: ImplementationReport | None = None
+    # P1-J: baseline test IDs collected before Claude ran (--collect-only -q).
+    baseline_tests_collected: list[str] = field(default_factory=list)
+    baseline_test_exit: int | None = None
+    baseline_test_output: str = ""
 
     @classmethod
     def new_id(cls) -> str:

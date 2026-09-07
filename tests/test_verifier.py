@@ -98,19 +98,22 @@ def test_verifier_detects_new_file(test_repo):
 
 def test_verifier_runs_tests_and_captures_exit_code(test_repo):
     """The verifier runs tests independently, not via Claude's report."""
+    # Inject a controlled failure so the verifier has a non-zero exit code to detect.
+    calc = test_repo / "calculator.py"
+    calc.write_text(calc.read_text(encoding="utf-8").replace("return a + b", "return a + b + 999"), encoding="utf-8")
+
     verifier = Verifier()
     task = _make_task(str(test_repo))
     execution = _make_execution(task.task_id, str(test_repo))
     result = verifier.verify(task, execution)
 
-    # The unpatched test-repository has failing tests
     assert result.test_exit_code is not None
-    assert result.test_exit_code != 0  # some tests fail due to the bug
+    assert result.test_exit_code != 0  # broken add() causes test_add to fail
     assert result.test_output != ""
 
 
 def test_verifier_passes_after_fix(test_repo):
-    """After the fix is applied, verifier should report tests passing."""
+    """After applying the bug fix, the verifier should report all tests passing."""
     calc = test_repo / "calculator.py"
     content = calc.read_text(encoding="utf-8")
     fixed = content.replace(
@@ -145,6 +148,10 @@ def test_verifier_flags_false_completed_claim(test_repo):
     Claude says COMPLETED but tests fail → report_agreement shows disagreement.
     Relay never accepts COMPLETED based solely on Claude's report.
     """
+    # Inject a controlled failure so the verifier has failing tests to catch.
+    calc = test_repo / "calculator.py"
+    calc.write_text(calc.read_text(encoding="utf-8").replace("return a + b", "return a + b + 999"), encoding="utf-8")
+
     false_report = ImplementationReport.from_dict({
         "protocol_version": "0.1",
         "message_type": "IMPLEMENTATION_REPORT",
