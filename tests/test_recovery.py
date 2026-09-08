@@ -7,6 +7,7 @@ from unittest.mock import patch
 import pytest
 
 from relay.models import (
+    AuditEventType,
     Execution,
     ExecutionLease,
     ExecutionStatus,
@@ -186,6 +187,9 @@ def test_cannot_restart_if_attempts_exhausted(tmp_db, audit, sample_task):
 
 
 def test_recovery_required_emits_audit_event(tmp_db, audit, sample_task):
+    # scan() now delegates to mark_stale_lease_atomic(), which emits
+    # RECOVERY_SCAN_STALE_LEASE (not the old RECOVERY_REQUIRED event that
+    # _transition_to_recovery used to emit via audit.recovery_required()).
     task, execution = _setup_running_task(tmp_db, sample_task.task_id, "/tmp/rec-ws")
 
     now = _now()
@@ -199,8 +203,8 @@ def test_recovery_required_emits_audit_event(tmp_db, audit, sample_task):
     engine.scan()
 
     events = tmp_db.get_events_for_task(sample_task.task_id)
-    event_types = [e.event_type.value for e in events]
-    assert "RECOVERY_REQUIRED" in event_types
+    event_types = [e.event_type for e in events]
+    assert AuditEventType.RECOVERY_SCAN_STALE_LEASE in event_types
 
 
 # ── Interrupted execution state ───────────────────────────────────────────────
@@ -287,3 +291,180 @@ def test_c8_restart_blocked_by_workspace_lease_not_repository(tmp_db, audit, sam
     )
     assert "lease" in reason.lower(), f"Expected 'lease' in reason: {reason!r}"
     assert workspace in reason or exec_.execution_id in reason
+
+
+# ── P1-K: scan/engine integration tests ──────────────────────────────────────
+#
+# These tests verify the new scan() behaviour after P1-K Step 3:
+#   - scan() delegates to mark_stale_lease_atomic() (atomic, not _transition_to_recovery)
+#   - RUNNING and VERIFYING tasks are both treated as recoverable
+#   - Live worker + valid lease is not treated as stale
+#   - Dead PID with unexpired lease is still stale
+#   - READY task stale leases are cleaned up without transitioning the task
+#   - Scan is idempotent; concurrent scans produce only one authority transition
+
+def _make_expired_lease_direct(tmp_db, execution_id: str) -> None:
+    """Force a lease into expired state via direct DB update (test helper)."""
+    tmp_db._conn().execute(
+        "UPDATE execution_leases SET expires_at=? WHERE execution_id=?",
+        ((_now() - timedelta(seconds=60)).isoformat(), execution_id),
+    )
+    tmp_db._conn().commit()
+
+
+def test_p1k_scan_verifying_transitions_to_recovery_required(tmp_db, audit, sample_task):
+    """Stale lease on a VERIFYING task must move it to RECOVERY_REQUIRED."""
+    task, execution = _setup_running_task(tmp_db, sample_task.task_id, "/tmp/p1k-verify-ws")
+    tmp_db.update_task_status(
+        sample_task.task_id, TaskStatus.VERIFYING, validate_transition=False
+    )
+    _make_expired_lease_direct(tmp_db, execution.execution_id)
+
+    engine = RecoveryEngine(tmp_db, audit)
+    requiring_recovery = engine.scan()
+
+    assert sample_task.task_id in requiring_recovery
+    task_after = tmp_db.get_task(sample_task.task_id)
+    assert task_after.status == TaskStatus.RECOVERY_REQUIRED
+
+    events = tmp_db.get_events_for_task(sample_task.task_id)
+    assert any(e.event_type == AuditEventType.RECOVERY_SCAN_STALE_LEASE for e in events)
+
+
+def test_p1k_scan_live_worker_unexpired_lease_no_recovery(tmp_db, audit, sample_task, monkeypatch):
+    """Live worker with a valid lease must not trigger recovery."""
+    _setup_running_task(tmp_db, sample_task.task_id, "/tmp/p1k-live-ws")
+    # Lease is unexpired (default from _make_lease).
+
+    monkeypatch.setattr(RecoveryEngine, "_worker_is_alive", lambda self, lease: True)
+
+    requiring_recovery = RecoveryEngine(tmp_db, audit).scan()
+
+    assert requiring_recovery == []
+    task_after = tmp_db.get_task(sample_task.task_id)
+    assert task_after.status == TaskStatus.RUNNING  # unchanged
+
+    events = tmp_db.get_events_for_task(sample_task.task_id)
+    assert not any(e.event_type == AuditEventType.RECOVERY_SCAN_STALE_LEASE for e in events)
+
+
+def test_p1k_scan_dead_pid_unexpired_lease_triggers_recovery(tmp_db, audit, sample_task, monkeypatch):
+    """Dead worker PID with an unexpired lease must still trigger recovery."""
+    task, execution = _setup_running_task(tmp_db, sample_task.task_id, "/tmp/p1k-dead-ws")
+    # Lease is unexpired — only the PID is dead.
+
+    monkeypatch.setattr(RecoveryEngine, "_worker_is_alive", lambda self, lease: False)
+
+    requiring_recovery = RecoveryEngine(tmp_db, audit).scan()
+
+    assert sample_task.task_id in requiring_recovery
+    task_after = tmp_db.get_task(sample_task.task_id)
+    assert task_after.status == TaskStatus.RECOVERY_REQUIRED
+
+
+def test_p1k_scan_stale_ready_lease_releases_lease_preserves_task(tmp_db, audit, sample_task):
+    """Stale lease on a READY task: lease released, task status unchanged, not in requiring_recovery."""
+    # sample_task starts in READY state.
+    ex = _make_running_execution(sample_task.task_id, "/tmp/p1k-ready-ws")
+    tmp_db.create_execution(ex)
+    tmp_db.acquire_lease(_make_lease(ex, expired=True))
+
+    engine = RecoveryEngine(tmp_db, audit)
+    requiring_recovery = engine.scan()
+
+    task_after = tmp_db.get_task(sample_task.task_id)
+    assert task_after.status == TaskStatus.READY  # unchanged
+
+    assert tmp_db.get_active_lease(ex.workspace) is None  # lease released
+
+    assert sample_task.task_id not in requiring_recovery
+
+    events = tmp_db.get_events_for_task(sample_task.task_id)
+    assert any(e.event_type == AuditEventType.RECOVERY_SCAN_STALE_LEASE for e in events)
+
+
+def test_p1k_scan_already_recovery_required_idempotent(tmp_db, audit, sample_task):
+    """Task already in RECOVERY_REQUIRED with a stale lease: scan is idempotent on task status."""
+    task, execution = _setup_running_task(tmp_db, sample_task.task_id, "/tmp/p1k-idem-ws")
+    # Simulate a previous scan having already moved the task to RECOVERY_REQUIRED.
+    tmp_db.update_task_status(
+        sample_task.task_id, TaskStatus.RECOVERY_REQUIRED, validate_transition=False
+    )
+    _make_expired_lease_direct(tmp_db, execution.execution_id)
+
+    requiring_recovery = RecoveryEngine(tmp_db, audit).scan()
+
+    # Task stays RECOVERY_REQUIRED and is NOT re-added to requiring_recovery
+    task_after = tmp_db.get_task(sample_task.task_id)
+    assert task_after.status == TaskStatus.RECOVERY_REQUIRED
+    assert sample_task.task_id not in requiring_recovery
+
+
+def test_p1k_scan_repeated_no_duplicate_transition(tmp_db, audit, sample_task):
+    """Repeated scans must not produce duplicate state transitions or duplicate audit events."""
+    task, execution = _setup_running_task(tmp_db, sample_task.task_id, "/tmp/p1k-repeat-ws")
+    _make_expired_lease_direct(tmp_db, execution.execution_id)
+
+    engine = RecoveryEngine(tmp_db, audit)
+    result1 = engine.scan()
+    result2 = engine.scan()  # lease already released — no active leases found
+
+    assert result1 == [sample_task.task_id]
+    assert result2 == []
+
+    task_after = tmp_db.get_task(sample_task.task_id)
+    assert task_after.status == TaskStatus.RECOVERY_REQUIRED
+
+    events = tmp_db.get_events_for_task(sample_task.task_id)
+    stale_events = [e for e in events if e.event_type == AuditEventType.RECOVERY_SCAN_STALE_LEASE]
+    assert len(stale_events) == 1  # exactly one, not two
+
+
+def test_p1k_scan_concurrent_only_one_authority_transition(tmp_db, audit, sample_task):
+    """Two engine instances on the same DB produce only one authority transition."""
+    task, execution = _setup_running_task(tmp_db, sample_task.task_id, "/tmp/p1k-conc-ws")
+    _make_expired_lease_direct(tmp_db, execution.execution_id)
+
+    engine1 = RecoveryEngine(tmp_db, audit)
+    engine2 = RecoveryEngine(tmp_db, audit)
+
+    result1 = engine1.scan()  # First: task → RECOVERY_REQUIRED, lease released
+    result2 = engine2.scan()  # Second: no active leases found
+
+    assert result1 == [sample_task.task_id]
+    assert result2 == []
+
+    task_after = tmp_db.get_task(sample_task.task_id)
+    assert task_after.status == TaskStatus.RECOVERY_REQUIRED
+
+    events = tmp_db.get_events_for_task(sample_task.task_id)
+    stale_events = [e for e in events if e.event_type == AuditEventType.RECOVERY_SCAN_STALE_LEASE]
+    assert len(stale_events) == 1  # only one authority transition
+
+
+def test_p1k_scan_uses_mark_stale_lease_atomic(tmp_db, audit, sample_task, monkeypatch):
+    """scan() must call mark_stale_lease_atomic() and emit RECOVERY_SCAN_STALE_LEASE,
+    not the old _transition_to_recovery path which emitted RECOVERY_REQUIRED."""
+    task, execution = _setup_running_task(tmp_db, sample_task.task_id, "/tmp/p1k-atomic-ws")
+    _make_expired_lease_direct(tmp_db, execution.execution_id)
+
+    atomic_calls: list[str] = []
+    original = tmp_db.mark_stale_lease_atomic
+
+    def _recording(execution_id: str, actor: str = "relay") -> None:
+        atomic_calls.append(execution_id)
+        return original(execution_id, actor)
+
+    monkeypatch.setattr(tmp_db, "mark_stale_lease_atomic", _recording)
+
+    RecoveryEngine(tmp_db, audit).scan()
+
+    # The atomic method was called with the stale execution_id
+    assert execution.execution_id in atomic_calls
+
+    # The event type is RECOVERY_SCAN_STALE_LEASE (atomic path),
+    # not RECOVERY_REQUIRED (old _transition_to_recovery path).
+    events = tmp_db.get_events_for_task(sample_task.task_id)
+    event_types = {e.event_type for e in events}
+    assert AuditEventType.RECOVERY_SCAN_STALE_LEASE in event_types
+    assert AuditEventType.RECOVERY_REQUIRED not in event_types

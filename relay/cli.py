@@ -8,11 +8,12 @@ from pathlib import Path
 
 from .audit import AuditLog
 from .executor import ExecutionEngine
-from .models import Approval, Task, TaskStatus
+from .models import Approval, ExecutionStatus, Task, TaskStatus
+from .paths import WorkspaceBoundaryError, assert_within_workspace
 from .policy import PolicyEngine
 from .recovery import RecoveryEngine
 from .schemas import ValidationError, validate_task_input
-from .state import StateManager
+from .state import InvalidTransitionError, StateManager
 from .verifier import Verifier
 
 
@@ -177,9 +178,7 @@ def cmd_run_task(args) -> None:
             state.update_task_status(
                 task.task_id, TaskStatus.TIMEOUT, validate_transition=True
             )
-            audit.execution_timeout(
-                task.task_id, execution.execution_id, args.timeout
-            )
+            # EXECUTION_TIMEOUT already emitted by _invoke_claude(); no second call here.
             # H-2: clean up workspace after timeout; the lease is released by
             # the outer finally block.
             if not keep_workspace and execution.workspace:
@@ -331,6 +330,112 @@ def cmd_recover(args) -> None:
         print("No recovery required.")
 
 
+def cmd_accept_recovery(args) -> None:
+    """Reset a RECOVERY_REQUIRED task to READY after operator review."""
+    state, _, _ = _make_components(args.db)
+    task = state.get_task(args.task_id)
+
+    if task is None:
+        print(f"Task {args.task_id} not found.", file=sys.stderr)
+        sys.exit(1)
+    if task.status != TaskStatus.RECOVERY_REQUIRED:
+        print(
+            f"Task {args.task_id} is {task.status.value}. "
+            "Only RECOVERY_REQUIRED tasks can be accepted for recovery.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    if task.attempt_count >= task.max_execution_attempts:
+        print(
+            f"Task {args.task_id} has used all {task.max_execution_attempts} "
+            "allowed attempts. Manual intervention required.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    leases = state.get_active_leases_for_task(args.task_id)
+    if leases:
+        print(
+            f"Task {args.task_id} has an active lease on workspace "
+            f"{leases[0].workspace!r}. Cannot accept recovery safely.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    # Rename the interrupted workspace so the next run starts with a clean copy.
+    workspace_base = Path(args.workspace)
+    current_ws = workspace_base / args.task_id
+
+    executions = state.get_executions_for_task(args.task_id)
+    interrupted = [
+        e for e in reversed(executions)
+        if e.status == ExecutionStatus.INTERRUPTED
+    ]
+
+    if interrupted and current_ws.exists():
+        exec_id = interrupted[0].execution_id
+        renamed = workspace_base / f"{args.task_id}.interrupted.{exec_id[:8]}"
+        try:
+            assert_within_workspace(current_ws, workspace_base)
+            assert_within_workspace(renamed, workspace_base)
+            current_ws.rename(renamed)
+            print(f"Workspace preserved: {renamed}")
+        except WorkspaceBoundaryError as exc:
+            print(f"Workspace boundary violation: {exc}", file=sys.stderr)
+            sys.exit(1)
+        except OSError as exc:
+            print(f"Warning: workspace rename failed: {exc}", file=sys.stderr)
+
+    try:
+        state.accept_recovery_atomic(args.task_id, actor=args.actor)
+    except Exception as exc:
+        print(f"Recovery transition failed: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"Task {args.task_id}: recovery accepted.")
+    print(f"Status: READY")
+
+
+def cmd_retry_task(args) -> None:
+    """Reset a TIMEOUT task to READY for another execution attempt."""
+    state, _, _ = _make_components(args.db)
+    task = state.get_task(args.task_id)
+
+    if task is None:
+        print(f"Task {args.task_id} not found.", file=sys.stderr)
+        sys.exit(1)
+    if task.status != TaskStatus.TIMEOUT:
+        print(
+            f"Task {args.task_id} is {task.status.value}. "
+            "Only TIMEOUT tasks can be retried via this command.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    if task.attempt_count >= task.max_execution_attempts:
+        print(
+            f"Task {args.task_id} has used all {task.max_execution_attempts} "
+            "allowed attempts. Manual intervention required.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    leases = state.get_active_leases_for_task(args.task_id)
+    if leases:
+        print(
+            f"Task {args.task_id} has an active lease on workspace "
+            f"{leases[0].workspace!r}. Cannot retry safely.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    try:
+        state.retry_task_atomic(args.task_id, actor=args.actor)
+    except Exception as exc:
+        print(f"Retry failed: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"Task {args.task_id}: queued for retry.")
+    print(f"Status: READY")
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -377,6 +482,17 @@ def main() -> None:
 
     p = sub.add_parser("recover", help="Scan for interrupted executions")
     p.set_defaults(func=cmd_recover)
+
+    p = sub.add_parser("accept-recovery", help="Accept recovery for a RECOVERY_REQUIRED task")
+    p.add_argument("task_id")
+    p.add_argument("--actor", required=True, help="Identity of the operator accepting recovery")
+    p.add_argument("--workspace", default="./workspaces", help="Workspace base directory")
+    p.set_defaults(func=cmd_accept_recovery)
+
+    p = sub.add_parser("retry-task", help="Retry a TIMEOUT task")
+    p.add_argument("task_id")
+    p.add_argument("--actor", required=True, help="Identity of the operator requesting retry")
+    p.set_defaults(func=cmd_retry_task)
 
     args = parser.parse_args()
     if args.command is None:

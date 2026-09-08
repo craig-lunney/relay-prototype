@@ -53,6 +53,9 @@ class AuditEventType(str, Enum):
     TASK_FAILED = "TASK_FAILED"
     TASK_CANCELLED = "TASK_CANCELLED"
     RECOVERY_REQUIRED = "RECOVERY_REQUIRED"
+    RECOVERY_ACCEPTED = "RECOVERY_ACCEPTED"
+    TASK_RETRIED = "TASK_RETRIED"
+    RECOVERY_SCAN_STALE_LEASE = "RECOVERY_SCAN_STALE_LEASE"
 
 
 # Relay owns all state transitions. Agents cannot declare their own status.
@@ -63,7 +66,8 @@ ALLOWED_TRANSITIONS: dict[TaskStatus, frozenset[TaskStatus]] = {
                                              TaskStatus.FAILED}),
     TaskStatus.RUNNING:           frozenset({TaskStatus.VERIFYING, TaskStatus.FAILED,
                                              TaskStatus.TIMEOUT, TaskStatus.RECOVERY_REQUIRED}),
-    TaskStatus.VERIFYING:         frozenset({TaskStatus.COMPLETED, TaskStatus.FAILED}),
+    TaskStatus.VERIFYING:         frozenset({TaskStatus.COMPLETED, TaskStatus.FAILED,
+                                             TaskStatus.RECOVERY_REQUIRED}),
     TaskStatus.COMPLETED:         frozenset(),
     TaskStatus.FAILED:            frozenset(),
     TaskStatus.BLOCKED:           frozenset({TaskStatus.READY, TaskStatus.CANCELLED, TaskStatus.REJECTED}),

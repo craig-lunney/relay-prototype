@@ -8,6 +8,10 @@ from .audit import AuditLog
 from .models import ExecutionStatus, TaskStatus
 from .state import StateManager
 
+# TaskStatus values that represent "work is actively in progress" and therefore
+# require operator-reviewed recovery when a stale lease is detected.
+_RECOVERABLE_STATUSES = frozenset({TaskStatus.RUNNING, TaskStatus.VERIFYING})
+
 
 class RecoveryEngine:
     """
@@ -23,9 +27,23 @@ class RecoveryEngine:
         self._audit = audit
 
     def scan(self) -> list[str]:
-        """
-        Scan all active leases for expired or dead workers.
-        Returns task_ids that now require recovery.
+        """Scan all active leases for stale executions (expired lease or dead worker PID).
+
+        Returns task_ids that transitioned to RECOVERY_REQUIRED during this scan.
+
+        For each stale lease, delegates to StateManager.mark_stale_lease_atomic(),
+        which performs all database changes in a single transaction:
+          - Marks the execution INTERRUPTED (if still RUNNING).
+          - Releases the workspace lease.
+          - Transitions RUNNING|VERIFYING tasks to RECOVERY_REQUIRED.
+          - Emits a RECOVERY_SCAN_STALE_LEASE audit event.
+
+        READY tasks with stale leases have their leases released but their status
+        is preserved; they are not included in the returned list.
+
+        The scan is idempotent: once a lease is released, get_all_active_leases()
+        will not return it again, so repeated scans do not produce duplicate
+        state transitions or duplicate authority events.
         """
         now = datetime.now(timezone.utc)
         requiring_recovery: list[str] = []
@@ -38,15 +56,18 @@ class RecoveryEngine:
             lease_expired = now > lease.expires_at
             worker_gone = not self._worker_is_alive(lease)
 
-            if lease_expired or worker_gone:
-                reason = (
-                    f"Lease {lease.execution_id} expired at {lease.expires_at.isoformat()}."
-                    if lease_expired
-                    else f"Worker PID {lease.pid} is no longer alive."
-                )
-                self._transition_to_recovery(
-                    lease.task_id, lease.execution_id, reason
-                )
+            if not (lease_expired or worker_gone):
+                continue  # Live worker with a valid lease — not stale.
+
+            # Record whether this task requires recovery *before* the atomic
+            # operation, so the return value reflects the pre-scan state.
+            # mark_stale_lease_atomic() uses CAS guards and is idempotent on
+            # tasks that are not RUNNING|VERIFYING.
+            was_recoverable = task.status in _RECOVERABLE_STATUSES
+
+            self._state.mark_stale_lease_atomic(lease.execution_id)
+
+            if was_recoverable:
                 requiring_recovery.append(lease.task_id)
 
         return requiring_recovery
@@ -105,7 +126,7 @@ class RecoveryEngine:
 
         return True, "Safe to reset to READY."
 
-    # ── Internal ──────────────────────────────────────────────────────────────
+    # ── Internal helpers ──────────────────────────────────────────────────────
 
     def _worker_is_alive(self, lease) -> bool:
         if lease.pid is None:
@@ -129,25 +150,3 @@ class RecoveryEngine:
             return f'"{pid}"' in result.stdout
         except Exception:
             return False
-
-    def _transition_to_recovery(
-        self, task_id: str, execution_id: str, reason: str
-    ) -> None:
-        execution = self._state.get_execution(execution_id)
-        if execution and execution.status == ExecutionStatus.RUNNING:
-            execution.status = ExecutionStatus.INTERRUPTED
-            execution.error = reason
-            execution.ended_at = datetime.now(timezone.utc)
-            self._state.update_execution(execution)
-
-        self._state.release_lease(execution_id)
-
-        task = self._state.get_task(task_id)
-        if task and task.status == TaskStatus.RUNNING:
-            self._state.update_task_status(
-                task_id,
-                TaskStatus.RECOVERY_REQUIRED,
-                error=reason,
-                validate_transition=True,
-            )
-            self._audit.recovery_required(task_id, execution_id, reason)

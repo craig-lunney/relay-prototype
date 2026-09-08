@@ -366,10 +366,6 @@ class ExecutionEngine:
             self._audit.execution_failed(task.task_id, exec_id, execution.error)
             return execution
 
-        self._audit.execution_started(
-            task.task_id, exec_id, workspace, execution.attempt_number
-        )
-
         # P1-J: baseline capture before Claude runs. Stores collected test IDs
         # on the execution object so the verifier can detect test deletions.
         self._capture_baseline(task, execution, workspace)
@@ -508,9 +504,7 @@ class ExecutionEngine:
             execution.status = ExecutionStatus.FAILED
             execution.error = f"Authentication not configured: {auth_error}"
             execution.ended_at = datetime.now(timezone.utc)
-            self._audit.execution_failed(
-                task.task_id, execution.execution_id, execution.error
-            )
+            self._state.pre_launch_failed_atomic(execution.execution_id, execution.error)
             return
 
         cmd = [
@@ -547,6 +541,12 @@ class ExecutionEngine:
                 errors="replace",
                 env=_worker_environment(),  # P1-G: explicit curated env; never inherit parent
             )
+            # P1-K Step 5: emit EXECUTION_STARTED only after Popen succeeds so
+            # pre-launch failures (auth, missing binary) never produce a misleading
+            # EXECUTION_STARTED event in the audit trail.
+            self._audit.execution_started(
+                task.task_id, execution.execution_id, workspace, execution.attempt_number
+            )
             try:
                 out, err = proc.communicate(input=prompt, timeout=timeout_seconds)
                 execution.stdout = out or ""
@@ -560,16 +560,19 @@ class ExecutionEngine:
                 execution.exit_code = -1
                 timed_out = True
 
-        except FileNotFoundError:
+        except OSError as exc:
             execution.status = ExecutionStatus.FAILED
-            execution.error = (
-                f"Claude Code CLI not found at '{claude_exe}'. "
-                "Ensure 'claude' is on PATH."
-            )
+            if isinstance(exc, FileNotFoundError):
+                execution.error = (
+                    f"Claude Code CLI not found at '{claude_exe}'. "
+                    "Ensure 'claude' is on PATH."
+                )
+            else:
+                execution.error = (
+                    f"OS error launching Claude Code CLI at '{claude_exe}': {exc}"
+                )
             execution.ended_at = datetime.now(timezone.utc)
-            self._audit.execution_failed(
-                task.task_id, execution.execution_id, execution.error
-            )
+            self._state.pre_launch_failed_atomic(execution.execution_id, execution.error)
             return
 
         execution.ended_at = datetime.now(timezone.utc)

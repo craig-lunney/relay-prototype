@@ -519,6 +519,14 @@ class StateManager:
     def append_event(self, event: AuditEvent) -> None:
         """Append an audit event. Workers must never call this directly.
 
+        MAINTENANCE NOTE: This method commits independently via its own retry
+        loop and MUST NOT be called inside a ``with conn:`` block or after any
+        uncommitted DML on the same connection. Doing so would split work
+        across transactions, breaking atomicity. For operations that must
+        commit a state transition and an audit event together (all-or-nothing),
+        use the dedicated ``*_atomic()`` methods, which inline both the
+        sequence allocation and the event INSERT inside the same transaction.
+
         H-4: sequence assignment is made collision-safe via retry.  Two
         concurrent appenders may read the same MAX(sequence) and race to
         INSERT; the UNIQUE constraint on 'sequence' ensures only one wins.
@@ -592,3 +600,276 @@ class StateManager:
             details=json.loads(row["details"]),
             sequence=row["sequence"],
         )
+
+    # ── Atomic operations ─────────────────────────────────────────────────────
+    #
+    # Each method performs all required database writes inside ONE SQLite
+    # transaction (``with conn:``).  A state-transition UPDATE and its
+    # corresponding audit-event INSERT commit together or roll back together.
+    #
+    # These methods MUST NOT call update_task_status(), append_event(), or
+    # any other helper that issues its own conn.commit(), because doing so
+    # would split the work across multiple transactions and break atomicity.
+    # Sequence allocation for the audit event is inlined here for the same
+    # reason.
+
+    def accept_recovery_atomic(
+        self,
+        task_id: str,
+        actor: str = "relay",
+    ) -> None:
+        """Atomically transition RECOVERY_REQUIRED → READY and emit RECOVERY_ACCEPTED.
+
+        Re-checks task status inside the transaction (CAS pattern). Raises
+        InvalidTransitionError if the task is not RECOVERY_REQUIRED, or if a
+        concurrent writer changed the status between the read and the UPDATE.
+
+        Does NOT touch the filesystem, create an execution, increment attempts,
+        or launch Claude. Pure database state + audit only.
+        """
+        conn = self._conn()
+        now = _now_iso()
+        with conn:
+            row = conn.execute(
+                "SELECT status FROM tasks WHERE task_id=?", (task_id,)
+            ).fetchone()
+            if row is None:
+                raise InvalidTransitionError(f"Task {task_id!r} not found.")
+            current = TaskStatus(row["status"])
+            if current != TaskStatus.RECOVERY_REQUIRED:
+                raise InvalidTransitionError(
+                    f"accept_recovery_atomic: task {task_id!r} is {current.value!r}, "
+                    "expected RECOVERY_REQUIRED."
+                )
+            cursor = conn.execute(
+                "UPDATE tasks SET status=?, error=NULL, updated_at=? "
+                "WHERE task_id=? AND status=?",
+                (TaskStatus.READY.value, now, task_id, TaskStatus.RECOVERY_REQUIRED.value),
+            )
+            if cursor.rowcount == 0:
+                raise InvalidTransitionError(
+                    f"Concurrent modification: task {task_id!r} status changed "
+                    "during RECOVERY_REQUIRED → READY transition."
+                )
+            seq = conn.execute(
+                "SELECT COALESCE(MAX(sequence), 0) FROM events"
+            ).fetchone()[0] + 1
+            conn.execute(
+                """
+                INSERT INTO events
+                    (event_id, sequence, event_type, task_id, execution_id,
+                     timestamp, actor, details)
+                VALUES (?,?,?,?,?,?,?,?)
+                """,
+                (
+                    AuditEvent.new_id(), seq,
+                    AuditEventType.RECOVERY_ACCEPTED.value,
+                    task_id, None, now, actor,
+                    json.dumps({"previous_status": current.value}),
+                ),
+            )
+
+    def retry_task_atomic(
+        self,
+        task_id: str,
+        actor: str = "relay",
+    ) -> None:
+        """Atomically transition TIMEOUT → READY and emit TASK_RETRIED.
+
+        Re-checks task status and attempt ceiling inside the transaction (CAS).
+        Raises InvalidTransitionError if the task is not TIMEOUT, or if all
+        allowed attempts are exhausted, or if a concurrent writer changed the
+        status first.
+
+        Does NOT create an execution or touch the filesystem.
+        """
+        conn = self._conn()
+        now = _now_iso()
+        with conn:
+            row = conn.execute(
+                "SELECT status, attempt_count, max_execution_attempts "
+                "FROM tasks WHERE task_id=?",
+                (task_id,),
+            ).fetchone()
+            if row is None:
+                raise InvalidTransitionError(f"Task {task_id!r} not found.")
+            current = TaskStatus(row["status"])
+            if current != TaskStatus.TIMEOUT:
+                raise InvalidTransitionError(
+                    f"retry_task_atomic: task {task_id!r} is {current.value!r}, "
+                    "expected TIMEOUT."
+                )
+            attempt_count = row["attempt_count"]
+            max_attempts = row["max_execution_attempts"]
+            if attempt_count >= max_attempts:
+                raise InvalidTransitionError(
+                    f"retry_task_atomic: task {task_id!r} has exhausted "
+                    f"{attempt_count}/{max_attempts} attempt(s)."
+                )
+            cursor = conn.execute(
+                "UPDATE tasks SET status=?, error=NULL, updated_at=? "
+                "WHERE task_id=? AND status=?",
+                (TaskStatus.READY.value, now, task_id, TaskStatus.TIMEOUT.value),
+            )
+            if cursor.rowcount == 0:
+                raise InvalidTransitionError(
+                    f"Concurrent modification: task {task_id!r} status changed "
+                    "during TIMEOUT → READY transition."
+                )
+            seq = conn.execute(
+                "SELECT COALESCE(MAX(sequence), 0) FROM events"
+            ).fetchone()[0] + 1
+            conn.execute(
+                """
+                INSERT INTO events
+                    (event_id, sequence, event_type, task_id, execution_id,
+                     timestamp, actor, details)
+                VALUES (?,?,?,?,?,?,?,?)
+                """,
+                (
+                    AuditEvent.new_id(), seq,
+                    AuditEventType.TASK_RETRIED.value,
+                    task_id, None, now, actor,
+                    json.dumps({"attempt_count": attempt_count}),
+                ),
+            )
+
+    def mark_stale_lease_atomic(
+        self,
+        execution_id: str,
+        actor: str = "relay",
+    ) -> None:
+        """Atomically handle database changes when recovery finds a stale lease.
+
+        Within a single transaction:
+        - Marks the execution INTERRUPTED if it is still in RUNNING state (CAS).
+        - Releases the workspace lease (idempotent: skipped if already released).
+        - Transitions the task RUNNING|VERIFYING → RECOVERY_REQUIRED via CAS.
+          If the task is already RECOVERY_REQUIRED, or in any other state, its
+          status is left unchanged (the call is idempotent on task state).
+        - Emits a RECOVERY_SCAN_STALE_LEASE audit event unconditionally.
+
+        Safe against repeated/concurrent recovery attempts: repeated calls on
+        the same execution_id are no-ops on state (because of CAS guards and
+        the released=0 condition on the lease) and each call records its own
+        audit event.
+        """
+        conn = self._conn()
+        now = _now_iso()
+        with conn:
+            ex_row = conn.execute(
+                "SELECT task_id, status FROM executions WHERE execution_id=?",
+                (execution_id,),
+            ).fetchone()
+            if ex_row is None:
+                return
+            task_id = ex_row["task_id"]
+            ex_status = ExecutionStatus(ex_row["status"])
+
+            # Mark execution INTERRUPTED only if still RUNNING (CAS — idempotent)
+            if ex_status == ExecutionStatus.RUNNING:
+                conn.execute(
+                    "UPDATE executions SET status=?, error=?, ended_at=? "
+                    "WHERE execution_id=? AND status=?",
+                    (
+                        ExecutionStatus.INTERRUPTED.value,
+                        "Stale lease: worker did not renew the execution lease.",
+                        now, execution_id, ExecutionStatus.RUNNING.value,
+                    ),
+                )
+
+            # Release lease (idempotent: WHERE released=0 is a no-op if already 1)
+            conn.execute(
+                "UPDATE execution_leases SET released=1 "
+                "WHERE execution_id=? AND released=0",
+                (execution_id,),
+            )
+
+            # Transition task RUNNING|VERIFYING → RECOVERY_REQUIRED (CAS, idempotent)
+            task_transitioned = False
+            task_row = conn.execute(
+                "SELECT status FROM tasks WHERE task_id=?", (task_id,)
+            ).fetchone()
+            if task_row is not None:
+                task_status = TaskStatus(task_row["status"])
+                if task_status in (TaskStatus.RUNNING, TaskStatus.VERIFYING):
+                    cursor = conn.execute(
+                        "UPDATE tasks SET status=?, updated_at=? "
+                        "WHERE task_id=? AND status=?",
+                        (
+                            TaskStatus.RECOVERY_REQUIRED.value,
+                            now, task_id, task_status.value,
+                        ),
+                    )
+                    task_transitioned = cursor.rowcount > 0
+
+            seq = conn.execute(
+                "SELECT COALESCE(MAX(sequence), 0) FROM events"
+            ).fetchone()[0] + 1
+            conn.execute(
+                """
+                INSERT INTO events
+                    (event_id, sequence, event_type, task_id, execution_id,
+                     timestamp, actor, details)
+                VALUES (?,?,?,?,?,?,?,?)
+                """,
+                (
+                    AuditEvent.new_id(), seq,
+                    AuditEventType.RECOVERY_SCAN_STALE_LEASE.value,
+                    task_id, execution_id, now, actor,
+                    json.dumps({
+                        "execution_id": execution_id,
+                        "task_transitioned": task_transitioned,
+                    }),
+                ),
+            )
+
+    def pre_launch_failed_atomic(
+        self,
+        execution_id: str,
+        error: str,
+        actor: str = "relay",
+    ) -> None:
+        """Atomically mark a RUNNING execution FAILED before Claude launched, and emit EXECUTION_FAILED.
+
+        Used for pre-launch failures (auth misconfiguration, Popen failure) where
+        the execution record was created as RUNNING but Claude never started.
+        Commits the execution status update and the audit event in one transaction,
+        eliminating the window where the DB could show a RUNNING execution after
+        the audit event has already committed.
+
+        Callers may safely call update_execution() afterwards — it will re-write
+        the same FAILED status, which is idempotent.
+        """
+        conn = self._conn()
+        now = _now_iso()
+        with conn:
+            row = conn.execute(
+                "SELECT task_id FROM executions WHERE execution_id=?",
+                (execution_id,),
+            ).fetchone()
+            if row is None:
+                return
+            task_id = row["task_id"]
+            conn.execute(
+                "UPDATE executions SET status=?, ended_at=?, error=? "
+                "WHERE execution_id=?",
+                (ExecutionStatus.FAILED.value, now, error, execution_id),
+            )
+            seq = conn.execute(
+                "SELECT COALESCE(MAX(sequence), 0) FROM events"
+            ).fetchone()[0] + 1
+            conn.execute(
+                """
+                INSERT INTO events
+                    (event_id, sequence, event_type, task_id, execution_id,
+                     timestamp, actor, details)
+                VALUES (?,?,?,?,?,?,?,?)
+                """,
+                (
+                    AuditEvent.new_id(), seq,
+                    AuditEventType.EXECUTION_FAILED.value,
+                    task_id, execution_id, now, actor,
+                    json.dumps({"error": error}),
+                ),
+            )

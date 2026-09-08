@@ -144,3 +144,31 @@ def test_audit_event_type_enum_completeness():
     ]
     for name in required:
         assert AuditEventType(name).value == name
+
+
+# ── P1-K: VERIFYING → RECOVERY_REQUIRED transition ───────────────────────────
+
+def test_verifying_to_recovery_required_is_allowed():
+    allowed = ALLOWED_TRANSITIONS[TaskStatus.VERIFYING]
+    assert TaskStatus.RECOVERY_REQUIRED in allowed, (
+        "VERIFYING must allow transition to RECOVERY_REQUIRED"
+    )
+
+
+def test_verifying_still_allows_completed_and_failed():
+    allowed = ALLOWED_TRANSITIONS[TaskStatus.VERIFYING]
+    assert TaskStatus.COMPLETED in allowed
+    assert TaskStatus.FAILED in allowed
+
+
+# ── P1-K: new audit event types ──────────────────────────────────────────────
+
+def test_p1k_audit_event_types_exist():
+    new_types = [
+        "RECOVERY_ACCEPTED",
+        "TASK_RETRIED",
+        "RECOVERY_SCAN_STALE_LEASE",
+    ]
+    for name in new_types:
+        evt = AuditEventType(name)
+        assert evt.value == name, f"AuditEventType.{name} has wrong value: {evt.value!r}"
