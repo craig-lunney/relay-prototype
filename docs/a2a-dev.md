@@ -10,7 +10,8 @@ implements, see `docs/a2a-protocol-v0.2.md` (frozen — do not modify).
 ```
 a2a/
 ├── __init__.py       — package marker
-└── models.py         — A2ATaskTier, A2AProtocolState, ALLOWED_A2A_TRANSITIONS, A2ATask
+├── models.py         — A2ATaskTier, A2AProtocolState, ALLOWED_A2A_TRANSITIONS, A2ATask
+└── state.py          — A2AStateManager (SQLite persistence), A2AInvalidTransitionError
 ```
 
 ---
@@ -96,6 +97,43 @@ task_id = A2ATask.new_id()  # "A2A-3F9D2C1A" (prefix + 8 uppercase hex chars)
 
 ---
 
+## `A2AStateManager`
+
+SQLite-backed persistence for `A2ATask`. Located in `a2a/state.py`.
+
+```python
+from a2a.state import A2AStateManager, A2AInvalidTransitionError
+from a2a.models import A2ATask, A2ATaskTier, A2AProtocolState
+
+sm = A2AStateManager("path/to/a2a.db")
+
+# Create
+task = A2ATask(task_id=A2ATask.new_id(), title="...", tier=A2ATaskTier.T2,
+               github_issue_url="https://github.com/org/repo/issues/1")
+sm.create_task(task)
+
+# Read
+task = sm.get_task(task.task_id)   # returns A2ATask | None
+tasks = sm.list_tasks()            # returns list[A2ATask] ordered by created_at
+
+# State transition — enforces ALLOWED_A2A_TRANSITIONS, raises on violation
+try:
+    updated = sm.transition_state(task.task_id, A2AProtocolState.SPECCING)
+except A2AInvalidTransitionError as e:
+    ...  # invalid transition, or task not found, or concurrent modification
+```
+
+**Schema:** one table, `a2a_tasks`, with columns matching `A2ATask` fields. WAL mode
+enabled. `task_id` is the PRIMARY KEY.
+
+**CAS guard:** `transition_state` uses `UPDATE ... WHERE task_id=? AND state=<current>`.
+If `rowcount == 0` after a valid-looking transition, a concurrent writer changed the state
+first — this is raised as `A2AInvalidTransitionError` rather than silently overwriting.
+
+**Thread safety:** each thread gets its own `sqlite3.Connection` via `threading.local`.
+
+---
+
 ## Tests
 
 `tests/test_a2a_models.py` covers:
@@ -109,6 +147,21 @@ task_id = A2ATask.new_id()  # "A2A-3F9D2C1A" (prefix + 8 uppercase hex chars)
 - Full reachability from DRAFT
 
 Run with: `pytest tests/test_a2a_models.py -v`
+
+`tests/test_a2a_state.py` covers:
+- Creation and full field round-trip
+- Retrieval (`get_task`, `list_tasks`, ordering)
+- Duplicate create raises `sqlite3.IntegrityError`
+- T1 and T2/T3 happy-path transition sequences
+- BLOCKED_BY_DISCOVERY interruption on both tiers
+- Invalid transitions: validation failure and no state corruption
+- Terminal CLOSED rejects all targets
+- Non-existent task raises `A2AInvalidTransitionError`
+- Return value, `updated_at` advancement, immutable field preservation
+- Persistence across separate `A2AStateManager` instances (new DB connections)
+- Concurrent transition: threading test confirms exactly one winner
+
+Run with: `pytest tests/test_a2a_state.py -v`
 
 ---
 
