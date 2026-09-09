@@ -11,7 +11,8 @@ implements, see `docs/a2a-protocol-v0.2.md` (frozen — do not modify).
 a2a/
 ├── __init__.py       — package marker
 ├── models.py         — A2ATaskTier, A2AProtocolState, ALLOWED_A2A_TRANSITIONS, A2ATask
-└── state.py          — A2AStateManager (SQLite persistence), A2AInvalidTransitionError
+├── state.py          — A2AStateManager (SQLite persistence), A2AInvalidTransitionError
+└── service.py        — A2AService (lifecycle entry point), A2ATaskNotFoundError, A2ATransitionError
 ```
 
 ---
@@ -134,6 +135,52 @@ first — this is raised as `A2AInvalidTransitionError` rather than silently ove
 
 ---
 
+## `A2AService`
+
+The controlled entry point for task lifecycle operations. Located in `a2a/service.py`.
+Never accesses SQLite directly — delegates all persistence to `A2AStateManager`.
+
+```python
+from a2a.state import A2AStateManager
+from a2a.service import A2AService, A2ATaskNotFoundError, A2ATransitionError
+from a2a.models import A2ATaskTier, A2AProtocolState
+
+sm  = A2AStateManager("path/to/a2a.db")
+svc = A2AService(sm)
+
+# Create — task_id generated automatically, initial state is DRAFT
+task = svc.create_task(
+    title="Fix OG description on brand pages",
+    tier=A2ATaskTier.T2,
+    github_issue_url="https://github.com/org/repo/issues/7",
+)
+
+# Advance — enforces ALLOWED_A2A_TRANSITIONS via A2AStateManager
+try:
+    updated = svc.advance(task.task_id, A2AProtocolState.SPECCING)
+except A2ATaskNotFoundError as e:
+    print(e.task_id)        # task_id attribute
+except A2ATransitionError as e:
+    print(e.from_state)     # A2AProtocolState
+    print(e.to_state)       # A2AProtocolState
+    print(e.reason)         # str — from the state layer
+
+# Retrieve
+task = svc.get_task(task.task_id)   # raises A2ATaskNotFoundError if missing
+
+# List
+tasks = svc.list_tasks()            # list[A2ATask] ordered by created_at
+```
+
+**Error types:**
+
+| Exception | When raised | Key attributes |
+|---|---|---|
+| `A2ATaskNotFoundError` | `get_task` or `advance` on unknown `task_id` | `.task_id` |
+| `A2ATransitionError` | `advance` with forbidden target state | `.task_id`, `.from_state`, `.to_state`, `.reason` |
+
+---
+
 ## Tests
 
 `tests/test_a2a_models.py` covers:
@@ -162,6 +209,19 @@ Run with: `pytest tests/test_a2a_models.py -v`
 - Concurrent transition: threading test confirms exactly one winner
 
 Run with: `pytest tests/test_a2a_state.py -v`
+
+`tests/test_a2a_service.py` covers:
+- Creation: fields, tier acceptance, unique ID generation, DRAFT initial state
+- Retrieval: correct task returned, `A2ATaskNotFoundError` with `task_id` attribute
+- Listing: empty, multiple tasks, creation-order ordering
+- Valid transitions: T1/T2 happy paths, BLOCKED_BY_DISCOVERY roundtrip, Gate 1 rejection
+- Invalid transitions: `A2ATransitionError` with `from_state`/`to_state`/`reason`, CLOSED terminal
+- Missing task in `advance`: `A2ATaskNotFoundError`
+- State corruption: state unchanged after invalid transition attempt
+- Persistence via state manager: data created/advanced by service is visible directly
+  via `A2AStateManager`, and across separate service instances
+
+Run with: `pytest tests/test_a2a_service.py -v`
 
 ---
 
