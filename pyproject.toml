@@ -17,7 +17,7 @@ relay = "relay.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["relay*"]
+include = ["relay*", "a2a*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
