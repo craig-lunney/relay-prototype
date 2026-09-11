@@ -160,6 +160,20 @@ class A2AService:
                     "Required path: DRAFT → SPECCING → AWAITING_GATE_1 → IN_IMPLEMENTATION."
                 ),
             )
+        if (
+            task.tier in (A2ATaskTier.T2, A2ATaskTier.T3)
+            and task.state == A2AProtocolState.IN_IMPLEMENTATION
+            and new_state == A2AProtocolState.AWAITING_GATE_2
+        ):
+            raise A2ATransitionError(
+                task_id=task_id,
+                from_state=task.state,
+                to_state=new_state,
+                reason=(
+                    "T2/T3 tasks must pass through UNDER_REVIEW before AWAITING_GATE_2. "
+                    "Required path: IN_IMPLEMENTATION → UNDER_REVIEW → AWAITING_GATE_2."
+                ),
+            )
 
         try:
             return self._sm.transition_state(task_id, new_state)

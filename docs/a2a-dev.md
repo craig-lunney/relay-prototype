@@ -43,7 +43,7 @@ which sits above the state layer.
 
 ### Tier-specific path enforcement (`A2AService.advance()`)
 
-The service enforces two additional constraints before delegating to the state layer:
+The service enforces three additional constraints before delegating to the state layer:
 
 1. **T1 tasks** may never advance to `SPECCING`, `AWAITING_GATE_1`, or `UNDER_REVIEW`
    (T2/T3-only states). The abstract graph permits these transitions, but the service
@@ -54,7 +54,13 @@ The service enforces two additional constraints before delegating to the state l
    `SPECCING → AWAITING_GATE_1` path. Re-entry into `IN_IMPLEMENTATION` from
    `AWAITING_GATE_1`, `REVISION_NEEDED`, or `BLOCKED_BY_DISCOVERY` is not affected.
 
-Both checks raise `A2ATransitionError` with a reason string that names the violated
+3. **T2/T3 tasks** may not advance directly from `IN_IMPLEMENTATION` to
+   `AWAITING_GATE_2`, skipping `UNDER_REVIEW` (the T1 shortcut through Gate 2).
+   T2/T3 tasks must pass through `UNDER_REVIEW` first:
+   `IN_IMPLEMENTATION → UNDER_REVIEW → AWAITING_GATE_2`. This ensures the ChatGPT
+   review step is never bypassed for tasks that require it.
+
+All three checks raise `A2ATransitionError` with a reason string that names the violated
 tier constraint. The state layer (`A2AStateManager`) remains tier-agnostic.
 
 ### T1 path (Gate 2 only)
@@ -266,6 +272,9 @@ Run with: `pytest tests/test_a2a_state.py -v`
   T2/T3 tasks blocked from DRAFT → IN_IMPLEMENTATION shortcut; error attributes and reason strings
   verified; valid re-entry paths (AWAITING_GATE_1/REVISION_NEEDED/BLOCKED_BY_DISCOVERY → IN_IMPLEMENTATION)
   confirmed unaffected; T1 and T2 full happy paths confirmed unaffected
+- **T2/T3 UNDER_REVIEW gate (F-1 fix):** T2 and T3 tasks blocked from IN_IMPLEMENTATION →
+  AWAITING_GATE_2 shortcut; T2/T3 valid path through UNDER_REVIEW confirmed; T1 shortcut
+  IN_IMPLEMENTATION → AWAITING_GATE_2 confirmed unaffected; state not corrupted on rejection
 
 Run with: `pytest tests/test_a2a_service.py -v`
 
@@ -277,6 +286,8 @@ Run with: `pytest tests/test_a2a_service.py -v`
 - `list-tasks`: "No tasks." on empty, single/multiple task display, shows task_ids, exit 0 on empty
 - `advance`: prints new state + task_id, updates DB, T1 path, full T2 path; invalid transition → exit 1 + stderr + no stdout + state unchanged; missing task → exit 1 + stderr
 - **Tier-violation paths via CLI (A2A-18 gap, closed A2A-19):** T1→SPECCING, T1→AWAITING_GATE_1, T1→UNDER_REVIEW, T2 DRAFT→IN_IMPLEMENTATION → all exit 1 + stderr, no stdout, state unchanged
+- **T2/T3 UNDER_REVIEW gate via CLI (F-1 fix):** T2 and T3 IN_IMPLEMENTATION → AWAITING_GATE_2
+  shortcut → exit 1, stderr contains Error, no stdout, state unchanged
 - Parser structure: subcommand required, `--title`/`--tier`/`--issue-url` required on create-task, `--to` required on advance, `--db` defaults to `"a2a.db"`, `--db` override works
 
 Run with: `pytest tests/test_a2a_cli.py -v`

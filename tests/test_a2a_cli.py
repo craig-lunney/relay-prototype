@@ -463,6 +463,84 @@ def test_advance_t2_draft_to_in_implementation_does_not_corrupt_state(tmp_path, 
 
 
 # ---------------------------------------------------------------------------
+# advance — T2/T3 must not skip UNDER_REVIEW (F-1 fix)
+# ---------------------------------------------------------------------------
+
+def _advance_to_in_implementation(db_path: str, tier: str = "T2") -> str:
+    """Create a T2/T3 task and advance it to IN_IMPLEMENTATION via the valid path."""
+    svc = A2AService(A2AStateManager(db_path))
+    task = svc.create_task(
+        title="Task",
+        tier=A2ATaskTier(tier),
+        github_issue_url="https://github.com/org/repo/issues/1",
+    )
+    svc.advance(task.task_id, A2AProtocolState.SPECCING)
+    svc.advance(task.task_id, A2AProtocolState.AWAITING_GATE_1)
+    svc.advance(task.task_id, A2AProtocolState.IN_IMPLEMENTATION)
+    return task.task_id
+
+
+def test_advance_t2_skip_under_review_exits_1(tmp_path, capsys):
+    db = str(tmp_path / "a2a.db")
+    task_id = _advance_to_in_implementation(db, tier="T2")
+    with pytest.raises(SystemExit) as exc_info:
+        cmd_advance(_args(db=db, task_id=task_id, to_state="AWAITING_GATE_2"))
+    assert exc_info.value.code == 1
+
+
+def test_advance_t3_skip_under_review_exits_1(tmp_path, capsys):
+    db = str(tmp_path / "a2a.db")
+    task_id = _advance_to_in_implementation(db, tier="T3")
+    with pytest.raises(SystemExit) as exc_info:
+        cmd_advance(_args(db=db, task_id=task_id, to_state="AWAITING_GATE_2"))
+    assert exc_info.value.code == 1
+
+
+def test_advance_t2_skip_under_review_prints_to_stderr(tmp_path, capsys):
+    db = str(tmp_path / "a2a.db")
+    task_id = _advance_to_in_implementation(db, tier="T2")
+    with pytest.raises(SystemExit):
+        cmd_advance(_args(db=db, task_id=task_id, to_state="AWAITING_GATE_2"))
+    err = capsys.readouterr().err
+    assert "Error" in err
+    assert len(err.strip()) > 0
+
+
+def test_advance_t3_skip_under_review_prints_to_stderr(tmp_path, capsys):
+    db = str(tmp_path / "a2a.db")
+    task_id = _advance_to_in_implementation(db, tier="T3")
+    with pytest.raises(SystemExit):
+        cmd_advance(_args(db=db, task_id=task_id, to_state="AWAITING_GATE_2"))
+    err = capsys.readouterr().err
+    assert "Error" in err
+
+
+def test_advance_t2_skip_under_review_no_stdout(tmp_path, capsys):
+    db = str(tmp_path / "a2a.db")
+    task_id = _advance_to_in_implementation(db, tier="T2")
+    with pytest.raises(SystemExit):
+        cmd_advance(_args(db=db, task_id=task_id, to_state="AWAITING_GATE_2"))
+    assert capsys.readouterr().out == ""
+
+
+def test_advance_t3_skip_under_review_no_stdout(tmp_path, capsys):
+    db = str(tmp_path / "a2a.db")
+    task_id = _advance_to_in_implementation(db, tier="T3")
+    with pytest.raises(SystemExit):
+        cmd_advance(_args(db=db, task_id=task_id, to_state="AWAITING_GATE_2"))
+    assert capsys.readouterr().out == ""
+
+
+def test_advance_t2_skip_under_review_does_not_corrupt_state(tmp_path, capsys):
+    db = str(tmp_path / "a2a.db")
+    task_id = _advance_to_in_implementation(db, tier="T2")
+    with pytest.raises(SystemExit):
+        cmd_advance(_args(db=db, task_id=task_id, to_state="AWAITING_GATE_2"))
+    capsys.readouterr()
+    assert A2AStateManager(db).get_task(task_id).state == A2AProtocolState.IN_IMPLEMENTATION
+
+
+# ---------------------------------------------------------------------------
 # Parser — argument structure
 # ---------------------------------------------------------------------------
 

@@ -528,6 +528,79 @@ def test_t1_blocked_by_discovery_roundtrip_unaffected(svc):
 
 
 # ---------------------------------------------------------------------------
+# Tier-aware path enforcement — T2/T3 must not skip UNDER_REVIEW (F-1 fix)
+# ---------------------------------------------------------------------------
+
+def _advance_t2_t3_to_in_implementation(svc: A2AService, tier: A2ATaskTier) -> A2ATask:
+    """Create a T2/T3 task and advance it to IN_IMPLEMENTATION via the valid path."""
+    t = _create(svc, tier=tier)
+    svc.advance(t.task_id, A2AProtocolState.SPECCING)
+    svc.advance(t.task_id, A2AProtocolState.AWAITING_GATE_1)
+    svc.advance(t.task_id, A2AProtocolState.IN_IMPLEMENTATION)
+    return svc.get_task(t.task_id)
+
+
+def test_t2_cannot_skip_under_review(svc):
+    # Graph permits IN_IMPLEMENTATION → AWAITING_GATE_2; tier enforcement must block it for T2.
+    t = _advance_t2_t3_to_in_implementation(svc, A2ATaskTier.T2)
+    with pytest.raises(A2ATransitionError) as exc_info:
+        svc.advance(t.task_id, A2AProtocolState.AWAITING_GATE_2)
+    err = exc_info.value
+    assert err.task_id == t.task_id
+    assert err.from_state == A2AProtocolState.IN_IMPLEMENTATION
+    assert err.to_state == A2AProtocolState.AWAITING_GATE_2
+
+
+def test_t3_cannot_skip_under_review(svc):
+    t = _advance_t2_t3_to_in_implementation(svc, A2ATaskTier.T3)
+    with pytest.raises(A2ATransitionError) as exc_info:
+        svc.advance(t.task_id, A2AProtocolState.AWAITING_GATE_2)
+    err = exc_info.value
+    assert err.from_state == A2AProtocolState.IN_IMPLEMENTATION
+    assert err.to_state == A2AProtocolState.AWAITING_GATE_2
+
+
+def test_t2_skip_under_review_reason_names_constraint(svc):
+    t = _advance_t2_t3_to_in_implementation(svc, A2ATaskTier.T2)
+    with pytest.raises(A2ATransitionError) as exc_info:
+        svc.advance(t.task_id, A2AProtocolState.AWAITING_GATE_2)
+    reason = exc_info.value.reason
+    assert "UNDER_REVIEW" in reason
+    assert reason  # non-empty
+
+
+def test_t2_skip_under_review_does_not_corrupt_state(svc):
+    t = _advance_t2_t3_to_in_implementation(svc, A2ATaskTier.T2)
+    with pytest.raises(A2ATransitionError):
+        svc.advance(t.task_id, A2AProtocolState.AWAITING_GATE_2)
+    assert svc.get_task(t.task_id).state == A2AProtocolState.IN_IMPLEMENTATION
+
+
+def test_t2_valid_path_through_under_review(svc):
+    # IN_IMPLEMENTATION → UNDER_REVIEW → AWAITING_GATE_2 must remain valid for T2.
+    t = _advance_t2_t3_to_in_implementation(svc, A2ATaskTier.T2)
+    svc.advance(t.task_id, A2AProtocolState.UNDER_REVIEW)
+    svc.advance(t.task_id, A2AProtocolState.AWAITING_GATE_2)
+    assert svc.get_task(t.task_id).state == A2AProtocolState.AWAITING_GATE_2
+
+
+def test_t3_valid_path_through_under_review(svc):
+    # IN_IMPLEMENTATION → UNDER_REVIEW → AWAITING_GATE_2 must remain valid for T3.
+    t = _advance_t2_t3_to_in_implementation(svc, A2ATaskTier.T3)
+    svc.advance(t.task_id, A2AProtocolState.UNDER_REVIEW)
+    svc.advance(t.task_id, A2AProtocolState.AWAITING_GATE_2)
+    assert svc.get_task(t.task_id).state == A2AProtocolState.AWAITING_GATE_2
+
+
+def test_t1_can_advance_in_implementation_to_awaiting_gate_2(svc):
+    # T1 shortcut IN_IMPLEMENTATION → AWAITING_GATE_2 must remain valid.
+    t = _create(svc, tier=A2ATaskTier.T1)
+    svc.advance(t.task_id, A2AProtocolState.IN_IMPLEMENTATION)
+    svc.advance(t.task_id, A2AProtocolState.AWAITING_GATE_2)
+    assert svc.get_task(t.task_id).state == A2AProtocolState.AWAITING_GATE_2
+
+
+# ---------------------------------------------------------------------------
 # Persistence goes through A2AStateManager (not reimplemented in service)
 # ---------------------------------------------------------------------------
 
