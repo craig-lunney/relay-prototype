@@ -37,8 +37,25 @@ a2a/
 
 `ALLOWED_A2A_TRANSITIONS` is a `dict[A2AProtocolState, frozenset[A2AProtocolState]]`
 following the same pattern as `relay/models.py:ALLOWED_TRANSITIONS`. The dict captures
-the **union** of T1 and T2/T3 transitions — tier-specific enforcement is a higher-level
-concern layered on top.
+the **union** of T1 and T2/T3 transitions — the abstract graph is intentionally
+tier-agnostic. Tier-specific path enforcement is applied by `A2AService.advance()`,
+which sits above the state layer.
+
+### Tier-specific path enforcement (`A2AService.advance()`)
+
+The service enforces two additional constraints before delegating to the state layer:
+
+1. **T1 tasks** may never advance to `SPECCING`, `AWAITING_GATE_1`, or `UNDER_REVIEW`
+   (T2/T3-only states). The abstract graph permits these transitions, but the service
+   rejects them with `A2ATransitionError` when the task tier is T1.
+
+2. **T2/T3 tasks** may not advance directly from `DRAFT` to `IN_IMPLEMENTATION`
+   (the T1 shortcut). T2/T3 tasks must reach `IN_IMPLEMENTATION` via the full
+   `SPECCING → AWAITING_GATE_1` path. Re-entry into `IN_IMPLEMENTATION` from
+   `AWAITING_GATE_1`, `REVISION_NEEDED`, or `BLOCKED_BY_DISCOVERY` is not affected.
+
+Both checks raise `A2ATransitionError` with a reason string that names the violated
+tier constraint. The state layer (`A2AStateManager`) remains tier-agnostic.
 
 ### T1 path (Gate 2 only)
 
@@ -221,6 +238,10 @@ Run with: `pytest tests/test_a2a_state.py -v`
 - State corruption: state unchanged after invalid transition attempt
 - Persistence via state manager: data created/advanced by service is visible directly
   via `A2AStateManager`, and across separate service instances
+- **Tier-aware enforcement (A2A-18):** T1 tasks blocked from SPECCING/AWAITING_GATE_1/UNDER_REVIEW;
+  T2/T3 tasks blocked from DRAFT → IN_IMPLEMENTATION shortcut; error attributes and reason strings
+  verified; valid re-entry paths (AWAITING_GATE_1/REVISION_NEEDED/BLOCKED_BY_DISCOVERY → IN_IMPLEMENTATION)
+  confirmed unaffected; T1 and T2 full happy paths confirmed unaffected
 
 Run with: `pytest tests/test_a2a_service.py -v`
 

@@ -265,6 +265,170 @@ def test_advance_closed_rejects_all_further_transitions(svc):
 
 
 # ---------------------------------------------------------------------------
+# Tier-aware path enforcement (A2A-18)
+# ---------------------------------------------------------------------------
+
+# --- T1 forbidden states ----------------------------------------------------
+
+def test_t1_cannot_advance_to_speccing(svc):
+    # Graph permits DRAFT → SPECCING; tier enforcement must block it for T1.
+    t = _create(svc, tier=A2ATaskTier.T1)
+    with pytest.raises(A2ATransitionError) as exc_info:
+        svc.advance(t.task_id, A2AProtocolState.SPECCING)
+    err = exc_info.value
+    assert err.task_id == t.task_id
+    assert err.from_state == A2AProtocolState.DRAFT
+    assert err.to_state == A2AProtocolState.SPECCING
+
+
+def test_t1_cannot_advance_to_awaiting_gate_1(svc):
+    t = _create(svc, tier=A2ATaskTier.T1)
+    with pytest.raises(A2ATransitionError) as exc_info:
+        svc.advance(t.task_id, A2AProtocolState.AWAITING_GATE_1)
+    assert exc_info.value.to_state == A2AProtocolState.AWAITING_GATE_1
+
+
+def test_t1_cannot_advance_to_under_review(svc):
+    # Graph permits IN_IMPLEMENTATION → UNDER_REVIEW; tier enforcement must block it for T1.
+    t = _create(svc, tier=A2ATaskTier.T1)
+    svc.advance(t.task_id, A2AProtocolState.IN_IMPLEMENTATION)
+    with pytest.raises(A2ATransitionError) as exc_info:
+        svc.advance(t.task_id, A2AProtocolState.UNDER_REVIEW)
+    err = exc_info.value
+    assert err.from_state == A2AProtocolState.IN_IMPLEMENTATION
+    assert err.to_state == A2AProtocolState.UNDER_REVIEW
+
+
+def test_t1_tier_violation_reason_names_state(svc):
+    t = _create(svc, tier=A2ATaskTier.T1)
+    with pytest.raises(A2ATransitionError) as exc_info:
+        svc.advance(t.task_id, A2AProtocolState.SPECCING)
+    assert "SPECCING" in exc_info.value.reason
+    assert exc_info.value.reason  # non-empty
+
+
+def test_t1_tier_violation_mentions_t1_path(svc):
+    t = _create(svc, tier=A2ATaskTier.T1)
+    with pytest.raises(A2ATransitionError) as exc_info:
+        svc.advance(t.task_id, A2AProtocolState.SPECCING)
+    assert "T1" in exc_info.value.reason
+
+
+def test_t1_tier_violation_does_not_corrupt_state(svc):
+    t = _create(svc, tier=A2ATaskTier.T1)
+    with pytest.raises(A2ATransitionError):
+        svc.advance(t.task_id, A2AProtocolState.SPECCING)
+    assert svc.get_task(t.task_id).state == A2AProtocolState.DRAFT
+
+
+# --- T2/T3 DRAFT → IN_IMPLEMENTATION shortcut blocked ----------------------
+
+def test_t2_cannot_advance_draft_directly_to_in_implementation(svc):
+    # Graph permits DRAFT → IN_IMPLEMENTATION; tier enforcement must block it for T2.
+    t = _create(svc, tier=A2ATaskTier.T2)
+    with pytest.raises(A2ATransitionError) as exc_info:
+        svc.advance(t.task_id, A2AProtocolState.IN_IMPLEMENTATION)
+    err = exc_info.value
+    assert err.task_id == t.task_id
+    assert err.from_state == A2AProtocolState.DRAFT
+    assert err.to_state == A2AProtocolState.IN_IMPLEMENTATION
+
+
+def test_t3_cannot_advance_draft_directly_to_in_implementation(svc):
+    t = _create(svc, tier=A2ATaskTier.T3)
+    with pytest.raises(A2ATransitionError) as exc_info:
+        svc.advance(t.task_id, A2AProtocolState.IN_IMPLEMENTATION)
+    err = exc_info.value
+    assert err.from_state == A2AProtocolState.DRAFT
+    assert err.to_state == A2AProtocolState.IN_IMPLEMENTATION
+
+
+def test_t2_tier_violation_reason_names_speccing(svc):
+    t = _create(svc, tier=A2ATaskTier.T2)
+    with pytest.raises(A2ATransitionError) as exc_info:
+        svc.advance(t.task_id, A2AProtocolState.IN_IMPLEMENTATION)
+    assert "SPECCING" in exc_info.value.reason
+
+
+def test_t2_tier_violation_reason_names_t2_t3(svc):
+    t = _create(svc, tier=A2ATaskTier.T2)
+    with pytest.raises(A2ATransitionError) as exc_info:
+        svc.advance(t.task_id, A2AProtocolState.IN_IMPLEMENTATION)
+    reason = exc_info.value.reason
+    assert "T2" in reason or "T3" in reason
+
+
+def test_t2_draft_shortcut_does_not_corrupt_state(svc):
+    t = _create(svc, tier=A2ATaskTier.T2)
+    with pytest.raises(A2ATransitionError):
+        svc.advance(t.task_id, A2AProtocolState.IN_IMPLEMENTATION)
+    assert svc.get_task(t.task_id).state == A2AProtocolState.DRAFT
+
+
+# --- T2/T3 valid IN_IMPLEMENTATION entries still work ----------------------
+
+def test_t2_can_reach_in_implementation_via_gate_1(svc):
+    # AWAITING_GATE_1 → IN_IMPLEMENTATION is not the DRAFT shortcut and must still pass.
+    t = _create(svc, tier=A2ATaskTier.T2)
+    svc.advance(t.task_id, A2AProtocolState.SPECCING)
+    svc.advance(t.task_id, A2AProtocolState.AWAITING_GATE_1)
+    svc.advance(t.task_id, A2AProtocolState.IN_IMPLEMENTATION)
+    assert svc.get_task(t.task_id).state == A2AProtocolState.IN_IMPLEMENTATION
+
+
+def test_t2_can_reenter_in_implementation_from_revision_needed(svc):
+    t = _create(svc, tier=A2ATaskTier.T2)
+    for s in [
+        A2AProtocolState.SPECCING,
+        A2AProtocolState.AWAITING_GATE_1,
+        A2AProtocolState.IN_IMPLEMENTATION,
+        A2AProtocolState.UNDER_REVIEW,
+        A2AProtocolState.REVISION_NEEDED,
+        A2AProtocolState.IN_IMPLEMENTATION,
+    ]:
+        svc.advance(t.task_id, s)
+    assert svc.get_task(t.task_id).state == A2AProtocolState.IN_IMPLEMENTATION
+
+
+def test_t2_can_reenter_in_implementation_from_blocked_by_discovery(svc):
+    t = _create(svc, tier=A2ATaskTier.T2)
+    for s in [
+        A2AProtocolState.SPECCING,
+        A2AProtocolState.AWAITING_GATE_1,
+        A2AProtocolState.IN_IMPLEMENTATION,
+        A2AProtocolState.BLOCKED_BY_DISCOVERY,
+        A2AProtocolState.IN_IMPLEMENTATION,
+    ]:
+        svc.advance(t.task_id, s)
+    assert svc.get_task(t.task_id).state == A2AProtocolState.IN_IMPLEMENTATION
+
+
+# --- T1 valid path still works ---------------------------------------------
+
+def test_t1_valid_path_unaffected(svc):
+    t = _create(svc, tier=A2ATaskTier.T1)
+    for s in [
+        A2AProtocolState.IN_IMPLEMENTATION,
+        A2AProtocolState.AWAITING_GATE_2,
+        A2AProtocolState.SHIPPED,
+        A2AProtocolState.CLOSED,
+    ]:
+        svc.advance(t.task_id, s)
+    assert svc.get_task(t.task_id).state == A2AProtocolState.CLOSED
+
+
+def test_t1_blocked_by_discovery_roundtrip_unaffected(svc):
+    t = _create(svc, tier=A2ATaskTier.T1)
+    for s in [
+        A2AProtocolState.IN_IMPLEMENTATION,
+        A2AProtocolState.BLOCKED_BY_DISCOVERY,
+        A2AProtocolState.IN_IMPLEMENTATION,
+    ]:
+        svc.advance(t.task_id, s)
+    assert svc.get_task(t.task_id).state == A2AProtocolState.IN_IMPLEMENTATION
+
+
+# ---------------------------------------------------------------------------
 # Persistence goes through A2AStateManager (not reimplemented in service)
 # ---------------------------------------------------------------------------
 

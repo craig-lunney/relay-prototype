@@ -3,6 +3,15 @@ from __future__ import annotations
 from .models import A2AProtocolState, A2ATask, A2ATaskTier
 from .state import A2AInvalidTransitionError, A2AStateManager
 
+# States that exist only in the T2/T3 protocol path.
+# T1 tasks (DRAFT → IN_IMPLEMENTATION → AWAITING_GATE_2 → SHIPPED → CLOSED)
+# must never enter these states regardless of what the abstract graph permits.
+_T1_FORBIDDEN_STATES: frozenset[A2AProtocolState] = frozenset({
+    A2AProtocolState.SPECCING,
+    A2AProtocolState.AWAITING_GATE_1,
+    A2AProtocolState.UNDER_REVIEW,
+})
+
 
 class A2ATaskNotFoundError(Exception):
     """Raised when a task_id does not exist in the state store."""
@@ -81,11 +90,43 @@ class A2AService:
 
         Raises A2ATaskNotFoundError if the task does not exist.
         Raises A2ATransitionError if the transition is not allowed from the
-        current state, or if a concurrent writer committed a change first.
+        current state, if a tier-specific path constraint is violated, or if a
+        concurrent writer committed a change first.
         """
         task = self._sm.get_task(task_id)
         if task is None:
             raise A2ATaskNotFoundError(task_id)
+
+        # Tier-specific path enforcement.  The abstract state graph is intentionally
+        # tier-agnostic (it is the union of all valid paths); the tier constraints
+        # are enforced here in the service layer before delegating to the state layer.
+        if task.tier == A2ATaskTier.T1 and new_state in _T1_FORBIDDEN_STATES:
+            raise A2ATransitionError(
+                task_id=task_id,
+                from_state=task.state,
+                to_state=new_state,
+                reason=(
+                    f"{new_state.value} is not part of the T1 protocol path. "
+                    "T1 tasks follow: DRAFT → IN_IMPLEMENTATION → AWAITING_GATE_2 "
+                    "→ SHIPPED → CLOSED."
+                ),
+            )
+        if (
+            task.tier in (A2ATaskTier.T2, A2ATaskTier.T3)
+            and task.state == A2AProtocolState.DRAFT
+            and new_state == A2AProtocolState.IN_IMPLEMENTATION
+        ):
+            raise A2ATransitionError(
+                task_id=task_id,
+                from_state=task.state,
+                to_state=new_state,
+                reason=(
+                    "T2/T3 tasks must enter IN_IMPLEMENTATION via AWAITING_GATE_1, "
+                    "not directly from DRAFT. "
+                    "Required path: DRAFT → SPECCING → AWAITING_GATE_1 → IN_IMPLEMENTATION."
+                ),
+            )
+
         try:
             return self._sm.transition_state(task_id, new_state)
         except A2AInvalidTransitionError as exc:
