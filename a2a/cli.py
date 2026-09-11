@@ -4,7 +4,7 @@ import argparse
 import sys
 
 from .models import A2AProtocolState, A2ATask, A2ATaskTier
-from .service import A2AService, A2ATaskNotFoundError, A2ATransitionError
+from .service import A2AService, A2AInvalidTaskError, A2ATaskNotFoundError, A2ATransitionError
 from .state import A2AStateManager
 
 
@@ -25,11 +25,15 @@ def _task_lines(task: A2ATask) -> str:
 def cmd_create_task(args) -> None:
     svc = _make_service(args.db)
     tier = A2ATaskTier(args.tier)   # safe: argparse choices already validated
-    task = svc.create_task(
-        title=args.title,
-        tier=tier,
-        github_issue_url=args.issue_url,
-    )
+    try:
+        task = svc.create_task(
+            title=args.title,
+            tier=tier,
+            github_issue_url=args.issue_url,
+        )
+    except A2AInvalidTaskError as exc:
+        print(f"Error: {exc.reason}", file=sys.stderr)
+        sys.exit(1)
     print(f"Created: {task.task_id}")
     print(_task_lines(task))
 

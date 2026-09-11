@@ -296,6 +296,138 @@ def test_advance_missing_task_prints_to_stderr(tmp_path, capsys):
 
 
 # ---------------------------------------------------------------------------
+# create-task — invalid Issue URL (A2A-19)
+# ---------------------------------------------------------------------------
+
+def test_create_task_invalid_url_exits_1(tmp_path, capsys):
+    db = str(tmp_path / "a2a.db")
+    with pytest.raises(SystemExit) as exc_info:
+        cmd_create_task(_args(db=db, issue_url="not-a-github-issue-url"))
+    assert exc_info.value.code == 1
+
+
+def test_create_task_invalid_url_prints_to_stderr(tmp_path, capsys):
+    db = str(tmp_path / "a2a.db")
+    with pytest.raises(SystemExit):
+        cmd_create_task(_args(db=db, issue_url="https://gitlab.com/org/repo/issues/1"))
+    err = capsys.readouterr().err
+    assert "Error" in err
+    assert len(err.strip()) > 0
+
+
+def test_create_task_invalid_url_no_stdout(tmp_path, capsys):
+    db = str(tmp_path / "a2a.db")
+    with pytest.raises(SystemExit):
+        cmd_create_task(_args(db=db, issue_url="https://github.com/org/repo/pulls/1"))
+    assert capsys.readouterr().out == ""
+
+
+def test_create_task_invalid_url_no_task_persisted(tmp_path, capsys):
+    db = str(tmp_path / "a2a.db")
+    with pytest.raises(SystemExit):
+        cmd_create_task(_args(db=db, issue_url="bad-url"))
+    capsys.readouterr()
+    assert A2AStateManager(db).list_tasks() == []
+
+
+def test_create_task_pr_url_exits_1(tmp_path, capsys):
+    db = str(tmp_path / "a2a.db")
+    with pytest.raises(SystemExit) as exc_info:
+        cmd_create_task(_args(db=db, issue_url="https://github.com/org/repo/pulls/5"))
+    assert exc_info.value.code == 1
+
+
+def test_create_task_zero_issue_number_exits_1(tmp_path, capsys):
+    db = str(tmp_path / "a2a.db")
+    with pytest.raises(SystemExit) as exc_info:
+        cmd_create_task(_args(db=db, issue_url="https://github.com/org/repo/issues/0"))
+    assert exc_info.value.code == 1
+
+
+# ---------------------------------------------------------------------------
+# advance — tier-violation paths at CLI level (A2A-18 gap, closed in A2A-19)
+# ---------------------------------------------------------------------------
+
+def test_advance_t1_to_speccing_exits_1(tmp_path, capsys):
+    db = str(tmp_path / "a2a.db")
+    task_id = _create_in_db(db, tier="T1")
+    with pytest.raises(SystemExit) as exc_info:
+        cmd_advance(_args(db=db, task_id=task_id, to_state="SPECCING"))
+    assert exc_info.value.code == 1
+
+
+def test_advance_t1_to_speccing_prints_to_stderr(tmp_path, capsys):
+    db = str(tmp_path / "a2a.db")
+    task_id = _create_in_db(db, tier="T1")
+    with pytest.raises(SystemExit):
+        cmd_advance(_args(db=db, task_id=task_id, to_state="SPECCING"))
+    err = capsys.readouterr().err
+    assert "Error" in err
+
+
+def test_advance_t1_to_speccing_no_stdout(tmp_path, capsys):
+    db = str(tmp_path / "a2a.db")
+    task_id = _create_in_db(db, tier="T1")
+    with pytest.raises(SystemExit):
+        cmd_advance(_args(db=db, task_id=task_id, to_state="SPECCING"))
+    assert capsys.readouterr().out == ""
+
+
+def test_advance_t1_to_awaiting_gate_1_exits_1(tmp_path, capsys):
+    db = str(tmp_path / "a2a.db")
+    task_id = _create_in_db(db, tier="T1")
+    with pytest.raises(SystemExit) as exc_info:
+        cmd_advance(_args(db=db, task_id=task_id, to_state="AWAITING_GATE_1"))
+    assert exc_info.value.code == 1
+
+
+def test_advance_t1_to_under_review_exits_1(tmp_path, capsys):
+    db = str(tmp_path / "a2a.db")
+    task_id = _create_in_db(db, tier="T1")
+    # advance T1 task to IN_IMPLEMENTATION (valid), then attempt UNDER_REVIEW (tier-forbidden)
+    cmd_advance(_args(db=db, task_id=task_id, to_state="IN_IMPLEMENTATION"))
+    capsys.readouterr()
+    with pytest.raises(SystemExit) as exc_info:
+        cmd_advance(_args(db=db, task_id=task_id, to_state="UNDER_REVIEW"))
+    assert exc_info.value.code == 1
+
+
+def test_advance_t1_tier_violation_does_not_corrupt_state(tmp_path, capsys):
+    db = str(tmp_path / "a2a.db")
+    task_id = _create_in_db(db, tier="T1")
+    with pytest.raises(SystemExit):
+        cmd_advance(_args(db=db, task_id=task_id, to_state="SPECCING"))
+    capsys.readouterr()
+    assert A2AStateManager(db).get_task(task_id).state == A2AProtocolState.DRAFT
+
+
+def test_advance_t2_draft_to_in_implementation_exits_1(tmp_path, capsys):
+    db = str(tmp_path / "a2a.db")
+    task_id = _create_in_db(db, tier="T2")
+    with pytest.raises(SystemExit) as exc_info:
+        cmd_advance(_args(db=db, task_id=task_id, to_state="IN_IMPLEMENTATION"))
+    assert exc_info.value.code == 1
+
+
+def test_advance_t2_draft_to_in_implementation_prints_to_stderr(tmp_path, capsys):
+    db = str(tmp_path / "a2a.db")
+    task_id = _create_in_db(db, tier="T2")
+    with pytest.raises(SystemExit):
+        cmd_advance(_args(db=db, task_id=task_id, to_state="IN_IMPLEMENTATION"))
+    err = capsys.readouterr().err
+    assert "Error" in err
+
+
+def test_advance_t2_draft_to_in_implementation_does_not_corrupt_state(tmp_path, capsys):
+    db = str(tmp_path / "a2a.db")
+    task_id = _create_in_db(db, tier="T2")
+    with pytest.raises(SystemExit):
+        cmd_advance(_args(db=db, task_id=task_id, to_state="IN_IMPLEMENTATION"))
+    capsys.readouterr()
+    assert A2AStateManager(db).get_task(task_id).state == A2AProtocolState.DRAFT
+
+
+# ---------------------------------------------------------------------------
 # Parser — argument structure
 # ---------------------------------------------------------------------------
 

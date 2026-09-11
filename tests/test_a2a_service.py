@@ -4,7 +4,7 @@ from __future__ import annotations
 import pytest
 
 from a2a.models import A2AProtocolState, A2ATask, A2ATaskTier
-from a2a.service import A2AService, A2ATaskNotFoundError, A2ATransitionError
+from a2a.service import A2AService, A2AInvalidTaskError, A2ATaskNotFoundError, A2ATransitionError
 from a2a.state import A2AStateManager
 
 
@@ -262,6 +262,64 @@ def test_advance_closed_rejects_all_further_transitions(svc):
     for target in A2AProtocolState:
         with pytest.raises(A2ATransitionError):
             svc.advance(t.task_id, target)
+
+
+# ---------------------------------------------------------------------------
+# GitHub Issue URL validation (A2A-19)
+# ---------------------------------------------------------------------------
+
+_VALID_URL = "https://github.com/org/repo/issues/1"
+
+
+def test_create_task_valid_url_accepted(svc):
+    task = svc.create_task(title="t", tier=A2ATaskTier.T2,
+                           github_issue_url=_VALID_URL)
+    assert task.github_issue_url == _VALID_URL
+
+
+@pytest.mark.parametrize("url, label", [
+    ("", "empty string"),
+    ("not a url", "garbage"),
+    ("https://gitlab.com/org/repo/issues/1", "non-github host"),
+    ("http://github.com/org/repo/issues/1", "http not https"),
+    ("https://github.com/org/repo/pulls/1", "PR URL"),
+    ("https://github.com/org/repo/issues", "missing issue number"),
+    ("https://github.com/org/repo/issues/", "trailing slash only"),
+    ("https://github.com/org/repo/issues/0", "zero issue number"),
+    ("https://github.com/org/repo/issues/-1", "negative issue number"),
+    ("https://github.com/org/repo/issues/abc", "non-numeric issue number"),
+    ("https://github.com/org/repo/issues/1/comments", "extra path segment"),
+    ("https://github.com/org/repo/issues/01", "leading zero"),
+])
+def test_create_task_invalid_url_rejected(svc, url, label):
+    with pytest.raises(A2AInvalidTaskError):
+        svc.create_task(title="t", tier=A2ATaskTier.T2, github_issue_url=url)
+
+
+def test_invalid_task_error_has_reason(svc):
+    with pytest.raises(A2AInvalidTaskError) as exc_info:
+        svc.create_task(title="t", tier=A2ATaskTier.T2, github_issue_url="bad")
+    assert exc_info.value.reason
+    assert "bad" in exc_info.value.reason
+
+
+def test_invalid_task_error_reason_names_expected_format(svc):
+    with pytest.raises(A2AInvalidTaskError) as exc_info:
+        svc.create_task(title="t", tier=A2ATaskTier.T2, github_issue_url="bad")
+    assert "github.com" in exc_info.value.reason
+
+
+def test_create_task_valid_url_large_issue_number(svc):
+    task = svc.create_task(title="t", tier=A2ATaskTier.T2,
+                           github_issue_url="https://github.com/org/repo/issues/99999")
+    assert task.task_id.startswith("A2A-")
+
+
+def test_create_task_url_not_persisted_on_invalid(svc):
+    with pytest.raises(A2AInvalidTaskError):
+        svc.create_task(title="t", tier=A2ATaskTier.T2,
+                        github_issue_url="https://github.com/org/repo/pulls/1")
+    assert svc.list_tasks() == []
 
 
 # ---------------------------------------------------------------------------

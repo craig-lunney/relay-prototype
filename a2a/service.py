@@ -1,7 +1,15 @@
 from __future__ import annotations
 
+import re
+
 from .models import A2AProtocolState, A2ATask, A2ATaskTier
 from .state import A2AInvalidTransitionError, A2AStateManager
+
+# Accepts only: https://github.com/<owner>/<repo>/issues/<positive-integer>
+# Rejects: http, non-github hosts, PR URLs, /issues/0, non-numeric, extra path segments.
+_GITHUB_ISSUE_URL_RE = re.compile(
+    r"^https://github\.com/[^/]+/[^/]+/issues/[1-9][0-9]*$"
+)
 
 # States that exist only in the T2/T3 protocol path.
 # T1 tasks (DRAFT → IN_IMPLEMENTATION → AWAITING_GATE_2 → SHIPPED → CLOSED)
@@ -11,6 +19,18 @@ _T1_FORBIDDEN_STATES: frozenset[A2AProtocolState] = frozenset({
     A2AProtocolState.AWAITING_GATE_1,
     A2AProtocolState.UNDER_REVIEW,
 })
+
+
+class A2AInvalidTaskError(Exception):
+    """Raised when task creation input fails validation.
+
+    Attributes:
+        reason: Human-readable explanation of the validation failure.
+    """
+
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+        super().__init__(reason)
 
 
 class A2ATaskNotFoundError(Exception):
@@ -71,7 +91,17 @@ class A2AService:
 
         A unique task_id is generated automatically. The task is returned
         in the state it was stored, which is always DRAFT.
+
+        Raises A2AInvalidTaskError if github_issue_url is not a valid GitHub
+        Issue URL of the form https://github.com/<owner>/<repo>/issues/<N>
+        where N is a positive integer.
         """
+        if not _GITHUB_ISSUE_URL_RE.match(github_issue_url):
+            raise A2AInvalidTaskError(
+                f"github_issue_url must be a GitHub Issue URL of the form "
+                f"https://github.com/<owner>/<repo>/issues/<number> "
+                f"(got {github_issue_url!r})."
+            )
         task = A2ATask(
             task_id=A2ATask.new_id(),
             title=title,

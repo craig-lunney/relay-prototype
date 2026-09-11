@@ -160,18 +160,24 @@ Never accesses SQLite directly — delegates all persistence to `A2AStateManager
 
 ```python
 from a2a.state import A2AStateManager
-from a2a.service import A2AService, A2ATaskNotFoundError, A2ATransitionError
+from a2a.service import A2AService, A2AInvalidTaskError, A2ATaskNotFoundError, A2ATransitionError
 from a2a.models import A2ATaskTier, A2AProtocolState
 
 sm  = A2AStateManager("path/to/a2a.db")
 svc = A2AService(sm)
 
 # Create — task_id generated automatically, initial state is DRAFT
-task = svc.create_task(
-    title="Fix OG description on brand pages",
-    tier=A2ATaskTier.T2,
-    github_issue_url="https://github.com/org/repo/issues/7",
-)
+# github_issue_url must be a valid GitHub Issue URL:
+#   https://github.com/<owner>/<repo>/issues/<positive-integer>
+# Raises A2AInvalidTaskError on any other value (validated at the service boundary).
+try:
+    task = svc.create_task(
+        title="Fix OG description on brand pages",
+        tier=A2ATaskTier.T2,
+        github_issue_url="https://github.com/org/repo/issues/7",
+    )
+except A2AInvalidTaskError as e:
+    print(e.reason)   # human-readable explanation
 
 # Advance — enforces ALLOWED_A2A_TRANSITIONS via A2AStateManager
 try:
@@ -190,10 +196,17 @@ task = svc.get_task(task.task_id)   # raises A2ATaskNotFoundError if missing
 tasks = svc.list_tasks()            # list[A2ATask] ordered by created_at
 ```
 
+**GitHub Issue URL constraint:** `create_task` validates `github_issue_url` before persisting.
+The URL must match `https://github.com/<owner>/<repo>/issues/<N>` where `N` is a positive
+integer (≥ 1). Rejected inputs include empty strings, non-URLs, non-GitHub hosts, GitHub
+PR URLs, `/issues/0`, non-numeric issue numbers, and extra path segments. No network
+request is made — validation is local and deterministic.
+
 **Error types:**
 
 | Exception | When raised | Key attributes |
 |---|---|---|
+| `A2AInvalidTaskError` | `create_task` with invalid `github_issue_url` | `.reason` |
 | `A2ATaskNotFoundError` | `get_task` or `advance` on unknown `task_id` | `.task_id` |
 | `A2ATransitionError` | `advance` with forbidden target state | `.task_id`, `.from_state`, `.to_state`, `.reason` |
 
@@ -229,6 +242,10 @@ Run with: `pytest tests/test_a2a_models.py -v`
 Run with: `pytest tests/test_a2a_state.py -v`
 
 `tests/test_a2a_service.py` covers:
+- **GitHub Issue URL validation (A2A-19):** valid URL accepted; 12 parametrised invalid URLs
+  rejected (empty, garbage, non-github, http, PR URL, no issue number, trailing slash,
+  /issues/0, negative, non-numeric, extra path, leading zero); `.reason` attribute populated;
+  no task persisted on invalid URL
 - Creation: fields, tier acceptance, unique ID generation, DRAFT initial state
 - Retrieval: correct task returned, `A2ATaskNotFoundError` with `task_id` attribute
 - Listing: empty, multiple tasks, creation-order ordering
@@ -247,9 +264,11 @@ Run with: `pytest tests/test_a2a_service.py -v`
 
 `tests/test_a2a_cli.py` covers:
 - `create-task`: prints task_id/DRAFT/title/tier/issue_url, persists to DB, all three tiers, DB configurable
+- **Invalid Issue URL (A2A-19):** bad URL, non-github URL, PR URL, `/issues/0` → exit 1 + stderr + no stdout + no task persisted
 - `get-task`: prints task_id/state/issue_url; missing → exit 1 + stderr message containing task_id + no stdout
 - `list-tasks`: "No tasks." on empty, single/multiple task display, shows task_ids, exit 0 on empty
 - `advance`: prints new state + task_id, updates DB, T1 path, full T2 path; invalid transition → exit 1 + stderr + no stdout + state unchanged; missing task → exit 1 + stderr
+- **Tier-violation paths via CLI (A2A-18 gap, closed A2A-19):** T1→SPECCING, T1→AWAITING_GATE_1, T1→UNDER_REVIEW, T2 DRAFT→IN_IMPLEMENTATION → all exit 1 + stderr, no stdout, state unchanged
 - Parser structure: subcommand required, `--title`/`--tier` required on create-task, `--to` required on advance, `--db` defaults to `"a2a.db"`, `--db` override works
 
 Run with: `pytest tests/test_a2a_cli.py -v`
