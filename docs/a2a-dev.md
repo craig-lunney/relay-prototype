@@ -12,7 +12,8 @@ a2a/
 ├── __init__.py       — package marker
 ├── models.py         — A2ATaskTier, A2AProtocolState, ALLOWED_A2A_TRANSITIONS, A2ATask
 ├── state.py          — A2AStateManager (SQLite persistence), A2AInvalidTransitionError
-└── service.py        — A2AService (lifecycle entry point), A2ATaskNotFoundError, A2ATransitionError
+├── service.py        — A2AService (lifecycle entry point), A2ATaskNotFoundError, A2ATransitionError
+└── cli.py            — argparse CLI (create-task, get-task, list-tasks, advance); entry point: `a2a`
 ```
 
 ---
@@ -222,6 +223,40 @@ Run with: `pytest tests/test_a2a_state.py -v`
   via `A2AStateManager`, and across separate service instances
 
 Run with: `pytest tests/test_a2a_service.py -v`
+
+`tests/test_a2a_cli.py` covers:
+- `create-task`: prints task_id/DRAFT/title/tier/issue_url, persists to DB, all three tiers, DB configurable
+- `get-task`: prints task_id/state/issue_url; missing → exit 1 + stderr message containing task_id + no stdout
+- `list-tasks`: "No tasks." on empty, single/multiple task display, shows task_ids, exit 0 on empty
+- `advance`: prints new state + task_id, updates DB, T1 path, full T2 path; invalid transition → exit 1 + stderr + no stdout + state unchanged; missing task → exit 1 + stderr
+- Parser structure: subcommand required, `--title`/`--tier` required on create-task, `--to` required on advance, `--db` defaults to `"a2a.db"`, `--db` override works
+
+Run with: `pytest tests/test_a2a_cli.py -v`
+
+---
+
+## CLI
+
+Entry point registered in `pyproject.toml` as `a2a = "a2a.cli:main"`. After `pip install -e .`:
+
+```bash
+a2a --help
+a2a create-task --title "Fix OG tags" --tier T2 --issue-url https://github.com/org/repo/issues/7
+a2a list-tasks
+a2a get-task A2A-3F9D2C1A
+a2a advance A2A-3F9D2C1A --to SPECCING
+```
+
+All commands accept `--db PATH` to specify a non-default SQLite file. Errors print to stderr and exit with code 1; success prints to stdout and exits 0.
+
+**Commands:**
+
+| Command | Required args | Action |
+|---|---|---|
+| `create-task` | `--title`, `--tier` (T1/T2/T3), `--issue-url` | Creates task in DRAFT; prints task_id + detail |
+| `get-task` | `TASK_ID` (positional) | Prints task detail; exit 1 if not found |
+| `list-tasks` | — | Lists all tasks ordered by creation time; "No tasks." if empty |
+| `advance` | `TASK_ID` (positional), `--to STATE` | Advances state; exit 1 on invalid transition or missing task |
 
 ---
 
