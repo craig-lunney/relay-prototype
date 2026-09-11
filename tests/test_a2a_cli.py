@@ -345,6 +345,41 @@ def test_create_task_zero_issue_number_exits_1(tmp_path, capsys):
 
 
 # ---------------------------------------------------------------------------
+# create-task — invalid title (A2A-20)
+# ---------------------------------------------------------------------------
+
+def test_create_task_empty_title_exits_1(tmp_path, capsys):
+    db = str(tmp_path / "a2a.db")
+    with pytest.raises(SystemExit) as exc_info:
+        cmd_create_task(_args(db=db, title=""))
+    assert exc_info.value.code == 1
+
+
+def test_create_task_empty_title_prints_to_stderr(tmp_path, capsys):
+    db = str(tmp_path / "a2a.db")
+    with pytest.raises(SystemExit):
+        cmd_create_task(_args(db=db, title=""))
+    err = capsys.readouterr().err
+    assert "Error" in err
+    assert len(err.strip()) > 0
+
+
+def test_create_task_empty_title_no_stdout(tmp_path, capsys):
+    db = str(tmp_path / "a2a.db")
+    with pytest.raises(SystemExit):
+        cmd_create_task(_args(db=db, title="   "))
+    assert capsys.readouterr().out == ""
+
+
+def test_create_task_empty_title_no_task_persisted(tmp_path, capsys):
+    db = str(tmp_path / "a2a.db")
+    with pytest.raises(SystemExit):
+        cmd_create_task(_args(db=db, title="\t"))
+    capsys.readouterr()
+    assert A2AStateManager(db).list_tasks() == []
+
+
+# ---------------------------------------------------------------------------
 # advance — tier-violation paths at CLI level (A2A-18 gap, closed in A2A-19)
 # ---------------------------------------------------------------------------
 
@@ -473,3 +508,10 @@ def test_parser_db_override():
     parser = _build_parser()
     args = parser.parse_args(["--db", "/tmp/custom.db", "list-tasks"])
     assert args.db == "/tmp/custom.db"
+
+
+def test_parser_create_task_requires_issue_url():
+    from a2a.cli import _build_parser
+    parser = _build_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(["create-task", "--title", "t", "--tier", "T2"])

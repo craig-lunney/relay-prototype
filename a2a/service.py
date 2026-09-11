@@ -96,6 +96,10 @@ class A2AService:
         Issue URL of the form https://github.com/<owner>/<repo>/issues/<N>
         where N is a positive integer.
         """
+        if not title or not title.strip():
+            raise A2AInvalidTaskError(
+                "title must not be empty or whitespace-only."
+            )
         if not _GITHUB_ISSUE_URL_RE.match(github_issue_url):
             raise A2AInvalidTaskError(
                 f"github_issue_url must be a GitHub Issue URL of the form "

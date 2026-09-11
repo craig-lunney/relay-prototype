@@ -323,6 +323,47 @@ def test_create_task_url_not_persisted_on_invalid(svc):
 
 
 # ---------------------------------------------------------------------------
+# Task title validation (A2A-20)
+# ---------------------------------------------------------------------------
+
+_VALID_TITLE = "Fix OG description on brand pages"
+_VALID_URL_FOR_TITLE = "https://github.com/org/repo/issues/1"
+
+
+@pytest.mark.parametrize("bad_title", [
+    "",
+    "   ",
+    "\t",
+    "\n",
+    " \t\n ",
+])
+def test_create_task_blank_title_rejected(svc, bad_title):
+    with pytest.raises(A2AInvalidTaskError):
+        svc.create_task(title=bad_title, tier=A2ATaskTier.T2,
+                        github_issue_url=_VALID_URL_FOR_TITLE)
+
+
+def test_create_task_blank_title_error_has_reason(svc):
+    with pytest.raises(A2AInvalidTaskError) as exc_info:
+        svc.create_task(title="", tier=A2ATaskTier.T2,
+                        github_issue_url=_VALID_URL_FOR_TITLE)
+    assert exc_info.value.reason
+
+
+def test_create_task_blank_title_not_persisted(svc):
+    with pytest.raises(A2AInvalidTaskError):
+        svc.create_task(title="  ", tier=A2ATaskTier.T2,
+                        github_issue_url=_VALID_URL_FOR_TITLE)
+    assert svc.list_tasks() == []
+
+
+def test_create_task_valid_title_accepted(svc):
+    task = svc.create_task(title=_VALID_TITLE, tier=A2ATaskTier.T2,
+                           github_issue_url=_VALID_URL_FOR_TITLE)
+    assert task.title == _VALID_TITLE
+
+
+# ---------------------------------------------------------------------------
 # Tier-aware path enforcement (A2A-18)
 # ---------------------------------------------------------------------------
 
