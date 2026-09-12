@@ -14,6 +14,7 @@ Covers the adversarial test matrix across six security property categories:
 from __future__ import annotations
 
 import json
+import shutil
 from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 
@@ -30,7 +31,7 @@ from relay.models import (
 from relay.paths import InvalidTestSpecifierError, validate_test_specifier
 from relay.schemas import ValidationError, validate_task_input
 from relay.state import InvalidTransitionError, StateManager
-from relay.testing import parse_test_results, _parse_collection_output
+from relay.testing import parse_test_results, _parse_collection_output, collect_tests, run_test_suite
 from relay.verifier import Verifier, VerificationResult
 
 
@@ -1042,3 +1043,165 @@ class TestExpectedDeletedTestsScope:
         )
         # Arbitrary declarations grant no exemption — test_real must be flagged.
         assert "test_calc.py::test_real" in deleted
+
+
+# ── P1-J-NC: Node-ID Consistency (H-3 rootdir-pinning) ───────────────────────
+
+def _make_nested_workspace(tmp_path, source_repo):
+    """Create a workspace inside an outer directory that has a pytest config file.
+
+    This reproduces the production condition where the workspace lives under the
+    relay-prototype project root, which contains pyproject.toml.  Without
+    --rootdir pinning, pytest's rootdir discovery would walk up past the workspace
+    and set rootdir to the outer project, causing collect_tests() to emit long
+    rootdir-relative node IDs that don't match the short IDs emitted by
+    run_test_suite().
+    """
+    outer = tmp_path / "outer_project"
+    outer.mkdir()
+    (outer / "pyproject.toml").write_text(
+        "[tool.pytest.ini_options]\ntestpaths = [\"tests\"]\n",
+        encoding="utf-8",
+    )
+    workspace = outer / "workspace"
+    shutil.copytree(str(source_repo), str(workspace))
+    return workspace
+
+
+class TestNodeIdConsistency:
+    """P1-J-NC: --rootdir pinning ensures baseline and final-run node IDs match.
+
+    Regression for the H-3 false-deletion bug: when the workspace is nested
+    inside a directory containing a pytest config file, collect_tests() would
+    emit rootdir-relative IDs (e.g. outer_project/workspace/test_foo.py::test_x)
+    while run_test_suite() emitted workspace-relative IDs (test_foo.py::test_x).
+    The exact-string comparison in _check_test_accountability() then reported
+    every baseline test as deleted, making H-3 deletion detection inoperable.
+    """
+
+    def test_plain_file_ids_match_in_nested_workspace(self, tmp_path, test_repo):
+        """Plain file specifier: collect and run-suite produce identical IDs when nested."""
+        workspace = _make_nested_workspace(tmp_path, test_repo)
+        from relay.executor import _worker_environment
+        env = _worker_environment()
+
+        _, collected_ids, _, _ = collect_tests(workspace, ["test_calculator.py"], env)
+        _, run_output, _ = run_test_suite(workspace, ["test_calculator.py"], env)
+        run_results = parse_test_results(run_output)
+
+        assert collected_ids, "collect_tests returned no IDs"
+        assert run_results is not None, "parse_test_results returned None (unparseable output)"
+        for node_id in collected_ids:
+            assert node_id in run_results, (
+                f"Baseline ID {node_id!r} not found in run results. "
+                f"Sample run keys: {sorted(run_results)[:3]}"
+            )
+
+    def test_explicit_node_id_matches_in_nested_workspace(self, tmp_path, test_repo):
+        """Explicit node-ID specifier: IDs remain consistent under nesting."""
+        workspace = _make_nested_workspace(tmp_path, test_repo)
+        from relay.executor import _worker_environment
+        env = _worker_environment()
+
+        specifiers = ["test_calculator.py::test_add"]
+        _, collected_ids, _, _ = collect_tests(workspace, specifiers, env)
+        _, run_output, _ = run_test_suite(workspace, specifiers, env)
+        run_results = parse_test_results(run_output)
+
+        assert collected_ids, "collect_tests returned no IDs"
+        assert run_results is not None
+        for node_id in collected_ids:
+            assert node_id in run_results, (
+                f"Explicit node-ID {node_id!r} not found in run results."
+            )
+
+    def test_parameterised_ids_match_including_suffix(self, tmp_path):
+        """Parameterised IDs (including [param] suffix) are preserved and match."""
+        # Create a minimal workspace with a parametrised test — no git required.
+        outer = tmp_path / "outer_project"
+        outer.mkdir()
+        (outer / "pyproject.toml").write_text(
+            "[tool.pytest.ini_options]\ntestpaths = [\"tests\"]\n",
+            encoding="utf-8",
+        )
+        workspace = outer / "workspace"
+        workspace.mkdir()
+        (workspace / "test_param.py").write_text(
+            "import pytest\n"
+            "@pytest.mark.parametrize('x', [1, 2, 3])\n"
+            "def test_values(x):\n"
+            "    assert x > 0\n",
+            encoding="utf-8",
+        )
+
+        from relay.executor import _worker_environment
+        env = _worker_environment()
+
+        _, collected_ids, _, _ = collect_tests(workspace, ["test_param.py"], env)
+        _, run_output, _ = run_test_suite(workspace, ["test_param.py"], env)
+        run_results = parse_test_results(run_output)
+
+        assert collected_ids, "collect_tests returned no parameterised IDs"
+        assert run_results is not None
+        # Every baseline ID (including its [param] suffix) must appear in run results.
+        for node_id in collected_ids:
+            assert node_id in run_results, (
+                f"Parameterised ID {node_id!r} not found in run results."
+            )
+        # Confirm parameter suffixes are actually present (not silently stripped).
+        assert any("[" in nid for nid in collected_ids), (
+            "No parameterised node IDs collected — test is inconclusive."
+        )
+
+    def test_no_false_deletions_in_nested_workspace(self, tmp_path, test_repo):
+        """End-to-end H-3: no false deletions when workspace is nested and tests are unchanged."""
+        workspace = _make_nested_workspace(tmp_path, test_repo)
+        from relay.executor import _worker_environment
+        env = _worker_environment()
+
+        _, baseline_ids, _, _ = collect_tests(workspace, ["test_calculator.py"], env)
+        _, run_output, _ = run_test_suite(workspace, ["test_calculator.py"], env)
+
+        task = Task(
+            task_id=Task.new_id(),
+            project_id="p",
+            repository=str(workspace),
+            base_ref="main",
+            working_ref="main",
+            objective="o",
+            requirements=[],
+            acceptance_criteria=[],
+            requested_actions=[],
+            forbidden_actions=[],
+            required_tests=["test_calculator.py"],
+            approval_policy="auto",
+        )
+
+        verifier = Verifier()
+        deleted, _, _, _, errors = verifier._check_test_accountability(
+            task, baseline_ids, True, run_output, 0
+        )
+
+        assert baseline_ids, "No baseline IDs collected — test is inconclusive."
+        assert deleted == [], (
+            f"False deletions detected in nested workspace: {deleted}. "
+            "This indicates collect_tests and run_test_suite produced mismatched node IDs."
+        )
+
+    def test_baseline_ids_are_workspace_relative(self, tmp_path, test_repo):
+        """Collected IDs must not contain path components from outside the workspace."""
+        workspace = _make_nested_workspace(tmp_path, test_repo)
+        from relay.executor import _worker_environment
+        env = _worker_environment()
+
+        _, collected_ids, _, _ = collect_tests(workspace, ["test_calculator.py"], env)
+
+        assert collected_ids, "collect_tests returned no IDs"
+        for node_id in collected_ids:
+            # No ancestor directory name should appear as a path prefix.
+            assert not node_id.startswith("outer_project"), (
+                f"ID {node_id!r} leaks outer project directory name."
+            )
+            assert not node_id.startswith("workspace/") and not node_id.startswith("workspace\\"), (
+                f"ID {node_id!r} leaks the workspace directory name itself."
+            )

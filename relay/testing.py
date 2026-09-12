@@ -16,10 +16,10 @@ _ANSI = re.compile(r"\x1b\[[0-9;]*[mGKHFJABCDEFsu]")
 
 # Match a test outcome line from `pytest -v` output.
 # Greedy on the node-ID portion so parameterised tails ([param0] etc.) are
-# captured inside the ID, not split off.  The status word is anchored to the
-# line end (optional trailing whitespace only).
+# captured inside the ID, not split off.  The optional suffix handles pytest's
+# progress indicator (e.g. "[ 41%]") introduced in pytest 9.x.
 _OUTCOME_RE = re.compile(
-    r"^(.+?::.+?)\s+(PASSED|FAILED|ERROR|SKIPPED|XFAILED|XPASS)\s*$"
+    r"^(.+?::.+?)\s+(PASSED|FAILED|ERROR|SKIPPED|XFAILED|XPASS)(?:\s+\[\s*\d+%\])?\s*$"
 )
 
 # Match a collected test ID from `pytest --collect-only -q` output.
@@ -50,7 +50,9 @@ def collect_tests(
         return 0, [], "", []
 
     errors: list[str] = []
-    args = ["--collect-only", "-q", "--"] + required_tests
+    # Pin rootdir to the workspace so node IDs are always workspace-relative,
+    # regardless of any pytest config files in ancestor directories.
+    args = ["--collect-only", "-q", f"--rootdir={workspace}", "--"] + required_tests
 
     for prefix in (["python", "-m", "pytest"], ["pytest"]):
         cmd = prefix + args
@@ -99,7 +101,9 @@ def run_test_suite(
         return None, "", []
 
     errors: list[str] = []
-    args = ["-v", "--tb=short", "--"] + required_tests
+    # Pin rootdir to the workspace so node IDs are always workspace-relative,
+    # matching the format produced by collect_tests().
+    args = ["-v", "--tb=short", f"--rootdir={workspace}", "--"] + required_tests
 
     for prefix in (["python", "-m", "pytest"], ["pytest"]):
         cmd = prefix + args

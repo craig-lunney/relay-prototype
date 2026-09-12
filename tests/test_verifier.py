@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from relay.models import Execution, ExecutionStatus, ImplementationReport, Task, TaskStatus
+from relay.testing import parse_test_results
 from relay.verifier import Verifier
 
 
@@ -218,3 +219,70 @@ def test_verifier_allows_expected_new_files(test_repo):
 
     result = verifier.verify(task, execution, expected_new_files=["expected_file.py"])
     assert "expected_file.py" not in result.unexpected_files
+
+
+# ── parse_test_results — pytest 9.x progress-suffix handling ─────────────────
+
+def test_parse_accepts_progress_suffix_passed():
+    raw = "tests/test_foo.py::test_bar PASSED [  5%]\n"
+    results = parse_test_results(raw)
+    assert results is not None
+    assert results["tests/test_foo.py::test_bar"] == "PASSED"
+
+
+def test_parse_accepts_progress_suffix_failed():
+    raw = "tests/test_foo.py::test_bar FAILED [ 41%]\n"
+    results = parse_test_results(raw)
+    assert results is not None
+    assert results["tests/test_foo.py::test_bar"] == "FAILED"
+
+
+def test_parse_accepts_progress_suffix_100_percent():
+    raw = "tests/test_foo.py::test_last PASSED [100%]\n"
+    results = parse_test_results(raw)
+    assert results is not None
+    assert results["tests/test_foo.py::test_last"] == "PASSED"
+
+
+def test_parse_multiple_outcomes_with_suffixes():
+    raw = (
+        "tests/test_foo.py::test_a PASSED [  5%]\n"
+        "tests/test_foo.py::test_b FAILED [ 10%]\n"
+        "tests/test_foo.py::test_c SKIPPED [ 15%]\n"
+    )
+    results = parse_test_results(raw)
+    assert results is not None
+    assert results["tests/test_foo.py::test_a"] == "PASSED"
+    assert results["tests/test_foo.py::test_b"] == "FAILED"
+    assert results["tests/test_foo.py::test_c"] == "SKIPPED"
+
+
+def test_parse_no_suffix_still_works():
+    """Lines without progress suffix continue to match (backwards compatibility)."""
+    raw = "tests/test_foo.py::test_bar PASSED\n"
+    results = parse_test_results(raw)
+    assert results is not None
+    assert results["tests/test_foo.py::test_bar"] == "PASSED"
+
+
+def test_parse_fail_closed_on_unparseable():
+    """Non-empty output with no outcome lines → None (fail closed)."""
+    raw = "this is not a test output line\njust some garbage\n"
+    results = parse_test_results(raw)
+    assert results is None
+
+
+def test_parse_conflict_returns_none():
+    """Conflicting outcomes for the same node ID → None (fail closed)."""
+    raw = (
+        "tests/test_foo.py::test_a PASSED [  5%]\n"
+        "tests/test_foo.py::test_a FAILED [ 10%]\n"
+    )
+    results = parse_test_results(raw)
+    assert results is None
+
+
+def test_parse_empty_input_returns_empty_dict():
+    """Empty input is not an error — no tests ran."""
+    results = parse_test_results("")
+    assert results == {}
