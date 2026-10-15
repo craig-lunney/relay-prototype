@@ -20,6 +20,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from tests.conftest import hold_worker_lease
+
 from relay.cli import cmd_run_task
 from relay.executor import ExecutionEngine
 from relay.models import (
@@ -218,6 +220,7 @@ class TestWorkspaceOwnership:
         def fake_run(task, workspace_base, timeout_seconds=120):
             s = StateManager(str(tmp_path / "relay_test.db"))
             s.update_task_status(task.task_id, TaskStatus.RUNNING, validate_transition=True)
+            hold_worker_lease(tmp_path / "relay_test.db", exec_obj)
             return exec_obj
 
         def fake_release(exec_id):
@@ -294,6 +297,7 @@ class TestDeleteDetection:
         def fake_run(task, workspace_base, timeout_seconds=120):
             s = StateManager(str(tmp_path / "relay_test.db"))
             s.update_task_status(task.task_id, TaskStatus.RUNNING, validate_transition=True)
+            hold_worker_lease(tmp_path / "relay_test.db", exec_obj)
             return exec_obj
 
         # Verifier result: test_precision is absent (deleted) from test_results.
@@ -385,6 +389,7 @@ class TestDeleteDetection:
         def fake_run(task, workspace_base, timeout_seconds=120):
             s = StateManager(str(tmp_path / "relay_test.db"))
             s.update_task_status(task.task_id, TaskStatus.RUNNING, validate_transition=True)
+            hold_worker_lease(tmp_path / "relay_test.db", exec_obj)
             return exec_obj
 
         # passed=False because baseline is empty (H-2).
@@ -503,6 +508,7 @@ class TestNoOpDetection:
         def fake_run(task, workspace_base, timeout_seconds=120):
             s = StateManager(str(tmp_path / "relay_test.db"))
             s.update_task_status(task.task_id, TaskStatus.RUNNING, validate_transition=True)
+            hold_worker_lease(tmp_path / "relay_test.db", exec_obj)
             return exec_obj
 
         # no_op=True blocks COMPLETED.

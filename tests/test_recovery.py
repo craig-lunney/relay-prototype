@@ -451,9 +451,9 @@ def test_p1k_scan_uses_mark_stale_lease_atomic(tmp_db, audit, sample_task, monke
     atomic_calls: list[str] = []
     original = tmp_db.mark_stale_lease_atomic
 
-    def _recording(execution_id: str, actor: str = "relay") -> None:
+    def _recording(execution_id: str, actor: str = "relay", **kwargs):
         atomic_calls.append(execution_id)
-        return original(execution_id, actor)
+        return original(execution_id, actor, **kwargs)
 
     monkeypatch.setattr(tmp_db, "mark_stale_lease_atomic", _recording)
 

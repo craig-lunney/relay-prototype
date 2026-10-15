@@ -28,6 +28,8 @@ from unittest.mock import patch
 
 import pytest
 
+from tests.conftest import hold_worker_lease
+
 from relay.cli import cmd_run_task
 from relay.executor import ExecutionEngine
 from relay.models import (
@@ -92,6 +94,7 @@ def _run_side_effect(db_path, return_exec):
     def _side_effect(task, workspace_base, timeout_seconds=120):
         s = StateManager(str(db_path))
         s.update_task_status(task.task_id, TaskStatus.RUNNING, validate_transition=True)
+        hold_worker_lease(db_path, return_exec)
         return return_exec
 
     return _side_effect

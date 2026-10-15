@@ -53,6 +53,10 @@ MAX_TIMEOUT_SECONDS = 300     # hard ceiling per execution
 DEFAULT_TIMEOUT_SECONDS = 120
 MAX_EXECUTION_ATTEMPTS = 3
 LEASE_GRACE_SECONDS = 30      # lease extends this far past timeout to cover cleanup
+# Batch 3 (E-10): when verification starts, the lease is renewed for this long so
+# a concurrent `relay recover` cannot declare a live verification stale.  Covers
+# the verifier's test-run timeout (120 s) with a wide margin.
+VERIFICATION_LEASE_SECONDS = 300
 
 
 def _worker_identity() -> str:
@@ -271,30 +275,11 @@ class ExecutionEngine:
 
         # P1-J: verify source repository is readable before preparing workspace.
         self._check_source_repository(task)
-        try:
-            workspace = self._prepare_workspace(task, workspace_base)
-        except RuntimeError as exc:
-            # base_ref checkout failed — fail closed.
-            # Claude is never launched; exit_code remains None (pre-launch discriminator).
-            # No lease is acquired; attempt_count is not incremented.
-            exec_id = Execution.new_id()
-            now = datetime.now(timezone.utc)
-            execution = Execution(
-                execution_id=exec_id,
-                task_id=task.task_id,
-                attempt_number=task.attempt_count + 1,
-                status=ExecutionStatus.FAILED,
-                workspace="",
-                worker_identity=_worker_identity(),
-                policy_version=POLICY_VERSION,
-                capability_snapshot=[],
-                started_at=now,
-                ended_at=now,
-                error=str(exc),
-            )
-            self._state.create_execution(execution)
-            self._audit.execution_failed(task.task_id, exec_id, execution.error)
-            return execution
+        # Batch 3 (E-9): the workspace path is computed here, but nothing on disk is
+        # touched until the lease below is owned.  Previously the existing
+        # workspace was deleted and re-copied before the lease was taken, so a
+        # concurrent run could destroy a workspace another execution held.
+        workspace = self._workspace_path(task, workspace_base)
 
         # P1-C: verify the workspace is within the canonical workspace_base before
         # creating any state. Raises RuntimeError if boundary cannot be established.
@@ -347,6 +332,52 @@ class ExecutionEngine:
             self._audit.execution_failed(
                 task.task_id, exec_id, execution.error
             )
+            # Batch 3: this attempt owns nothing.  Clearing the in-memory
+            # workspace stops the caller cleaning up (or releasing) a workspace
+            # that belongs to the lease holder.
+            execution.ownership_denied = True
+            execution.workspace = ""
+            return execution
+
+        # Batch 3: the lease is ours, but the task may have moved on since the
+        # caller read it as READY (another run finished, or is awaiting
+        # acceptance with its workspace kept for review).  Re-check before
+        # touching the workspace; if it is not READY, this attempt owns nothing.
+        current = self._state.get_task(task.task_id)
+        if current is None or current.status != TaskStatus.READY:
+            execution.status = ExecutionStatus.FAILED
+            execution.error = (
+                f"Task is no longer READY (now "
+                f"{current.status.value if current else 'missing'}). "
+                "Claude was not launched. Attempt count not incremented."
+            )
+            execution.ended_at = datetime.now(timezone.utc)
+            self._state.update_execution(execution)
+            self._state.release_lease(exec_id)
+            self._audit.execution_failed(task.task_id, exec_id, execution.error)
+            execution.ownership_denied = True
+            execution.workspace = ""
+            return execution
+
+        # Lease owned: only now is it safe to replace the workspace contents.
+        try:
+            self._prepare_workspace(task, workspace_base)
+        except (RuntimeError, OSError) as exc:
+            # Copy or base_ref checkout failed — fail closed.  Claude is never
+            # launched (exit_code stays None, the pre-launch discriminator), the
+            # attempt is not counted, the task stays READY, and the lease is
+            # released so the workspace is not left locked.
+            execution.status = ExecutionStatus.FAILED
+            execution.error = str(exc) if isinstance(exc, RuntimeError) else (
+                f"Workspace preparation failed: {exc}"
+            )
+            execution.ended_at = datetime.now(timezone.utc)
+            self._state.update_execution(execution)
+            # Remove any partial copy while the lease is still ours, then release.
+            self.cleanup_workspace(workspace, workspace_base)
+            self._state.release_lease(exec_id)
+            self._audit.execution_failed(task.task_id, exec_id, execution.error)
+            execution.workspace = ""
             return execution
 
         # Lease acquired — now commit to this attempt.
@@ -362,9 +393,13 @@ class ExecutionEngine:
             execution.error = f"Execution setup failed after lease acquisition: {exc}"
             execution.ended_at = datetime.now(timezone.utc)
             self._state.update_execution(execution)
+            self.cleanup_workspace(workspace, workspace_base)
             self._state.release_lease(exec_id)
             self._audit.execution_failed(task.task_id, exec_id, execution.error)
+            execution.workspace = ""
             return execution
+
+        execution.task_claimed = True
 
         # P1-J: baseline capture before Claude runs. Stores collected test IDs
         # on the execution object so the verifier can detect test deletions.
@@ -387,6 +422,11 @@ class ExecutionEngine:
                 f"Task repository {task.repository!r} is not a readable directory."
             )
 
+    @staticmethod
+    def _workspace_path(task: Task, workspace_base: str | Path) -> str:
+        """Canonical workspace path for *task* (P1-C: resolved, no indirection)."""
+        return str(Path(workspace_base).resolve() / task.task_id)
+
     def _prepare_workspace(self, task: Task, workspace_base: str | Path) -> str:
         """Copy the task repository into a fresh isolated workspace.
 
@@ -396,9 +436,8 @@ class ExecutionEngine:
         """
         # P1-C: resolve workspace_base to canonical form so the returned workspace
         # path is always absolute and free of .. / . / symlink indirection.
-        base = Path(workspace_base).resolve()
-        base.mkdir(parents=True, exist_ok=True)
-        workspace = base / task.task_id
+        workspace = Path(self._workspace_path(task, workspace_base))
+        workspace.parent.mkdir(parents=True, exist_ok=True)
         if workspace.exists():
             shutil.rmtree(str(workspace), onerror=_rm_readonly)
         shutil.copytree(task.repository, str(workspace))
@@ -410,12 +449,16 @@ class ExecutionEngine:
     def _checkout_base_ref(self, base_ref: str, workspace: str) -> None:
         """Check out base_ref in the workspace copy. Raises RuntimeError on failure."""
         try:
+            # Batch 3 (E-12): trailing "--" forces base_ref to be read as a
+            # revision, never a path; policy has already rejected option-like
+            # and malformed refs.  Curated env: never the operator's full env.
             result = subprocess.run(
-                ["git", "checkout", base_ref],
+                ["git", "checkout", base_ref, "--"],
                 cwd=workspace,
                 capture_output=True,
                 text=True,
                 timeout=30,
+                env=_worker_environment(),
             )
         except FileNotFoundError:
             raise RuntimeError(
@@ -444,10 +487,18 @@ class ExecutionEngine:
         test before Claude ran).
         """
         from .integrity import snapshot_workspace
-        from .testing import collect_tests
-        exit_code, collected, raw_output, _errors = collect_tests(
-            workspace, task.required_tests, _worker_environment()
-        )
+        from . import testing
+        from .paths import InvalidTestSpecifierError, validate_required_tests
+        try:
+            # Batch 3 (E-13): enforce workspace containment before pytest is
+            # ever run on the specifiers (the verifier re-checks it later).
+            validate_required_tests(task.required_tests, workspace)
+        except InvalidTestSpecifierError as exc:
+            exit_code, collected, raw_output = -1, [], f"Baseline not collected: {exc}"
+        else:
+            exit_code, collected, raw_output, _errors = testing.collect_tests(
+                workspace, task.required_tests, _worker_environment()
+            )
         execution.baseline_tests_collected = collected
         execution.baseline_test_exit = exit_code
         execution.baseline_test_output = raw_output

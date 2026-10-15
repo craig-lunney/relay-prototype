@@ -162,6 +162,14 @@ class Execution:
     # fail closed rather than silently skip the integrity check.
     baseline_manifest: str | None = None
     baseline_manifest_error: str | None = None
+    # Batch 3: runtime-only flags (not persisted), consumed by cmd_run_task.
+    # ownership_denied: this attempt never owned the task — the workspace lease
+    #   was held by another execution, or the task stopped being READY before
+    #   this attempt could claim it.  The CLI must change nothing.
+    # task_claimed: this attempt moved the task READY → RUNNING, so a later
+    #   pre-launch failure transitions it from RUNNING (otherwise from READY).
+    ownership_denied: bool = False
+    task_claimed: bool = False
 
     @classmethod
     def new_id(cls) -> str:

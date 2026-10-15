@@ -128,3 +128,26 @@ def sample_task(tmp_db, test_repo) -> Task:
     )
     tmp_db.create_task(task)
     return task
+
+
+def hold_worker_lease(db_path, execution) -> None:
+    """Make a faked ExecutionEngine.run honour the real contract: run() returns
+    with the execution recorded and its workspace lease still held (cmd_run_task
+    renews that lease before verifying and releases it afterwards)."""
+    from datetime import datetime, timedelta, timezone
+
+    from relay.models import ExecutionLease
+
+    state = StateManager(str(db_path))
+    if state.get_execution(execution.execution_id) is None:
+        state.create_execution(execution)
+    now = datetime.now(timezone.utc)
+    assert state.acquire_lease(ExecutionLease(
+        execution_id=execution.execution_id,
+        task_id=execution.task_id,
+        workspace=execution.workspace or f"lease-for-{execution.execution_id}",
+        pid=os.getpid(),
+        started_at=now,
+        expires_at=now + timedelta(seconds=600),
+        worker_identity="test-fake-run",
+    ))

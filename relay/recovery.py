@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import sqlite3
 import sys
 from datetime import datetime, timezone
 
@@ -65,10 +66,32 @@ class RecoveryEngine:
             # tasks that are not RUNNING|VERIFYING.
             was_recoverable = task.status in _RECOVERABLE_STATUSES
 
-            self._state.mark_stale_lease_atomic(lease.execution_id)
+            try:
+                handled = self._state.mark_stale_lease_atomic(
+                    lease.execution_id, expected_expires_at=lease.expires_at
+                )
+            except sqlite3.OperationalError:
+                # Database busy: leave this lease for the next scan rather than
+                # abandoning the whole scan.
+                continue
 
-            if was_recoverable:
+            if handled and was_recoverable:
                 requiring_recovery.append(lease.task_id)
+
+        # Batch 3 (E-7): tasks left RUNNING/VERIFYING with no lease at all are
+        # invisible to the lease scan above.  mark_orphaned_task_atomic re-checks
+        # inside its transaction that no active lease exists, so a live
+        # execution is never touched.
+        for task in self._state.get_tasks_by_status(list(_RECOVERABLE_STATUSES)):
+            try:
+                orphaned = self._state.mark_orphaned_task_atomic(
+                    task.task_id,
+                    reason=f"Task was {task.status.value} with no active execution lease.",
+                )
+            except sqlite3.OperationalError:
+                continue  # database busy: the next scan will find it again
+            if orphaned:
+                requiring_recovery.append(task.task_id)
 
         return requiring_recovery
 

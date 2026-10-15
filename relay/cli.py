@@ -3,11 +3,11 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from .audit import AuditLog
-from .executor import ExecutionEngine
+from .executor import VERIFICATION_LEASE_SECONDS, ExecutionEngine
 from .models import Approval, ExecutionStatus, Task, TaskStatus
 from .paths import WorkspaceBoundaryError, assert_within_workspace
 from .policy import PolicyEngine
@@ -15,6 +15,26 @@ from .recovery import RecoveryEngine
 from .schemas import ValidationError, validate_task_input
 from .state import InvalidTransitionError, StateManager
 from .verifier import AC_UNVERIFIED, Verifier, unverified_criteria
+
+
+def _lease_lost(state, task_id: str) -> None:
+    """Exit without writing anything: this run no longer owns the workspace."""
+    current = state.get_task(task_id)
+    print(
+        f"Task {task_id}: the workspace lease is no longer held by this run "
+        f"(task is now {current.status.value if current else 'missing'}), most likely "
+        "reclaimed by 'relay recover'. No verification result was recorded. "
+        "Run 'relay status' and 'relay recover' to review.",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+
+def _renew(state, execution_id: str) -> bool:
+    return state.renew_lease(
+        execution_id,
+        datetime.now(timezone.utc) + timedelta(seconds=VERIFICATION_LEASE_SECONDS),
+    )
 
 
 def _make_components(db_path: str):
@@ -142,12 +162,45 @@ def cmd_run_task(args) -> None:
             # P1-J: lease is held through verification to prevent a concurrent
             # execution from acquiring the workspace between worker exit and
             # verification completion.
-            state.update_task_status(
-                task.task_id, TaskStatus.VERIFYING, validate_transition=True
-            )
+            # Batch 3 (E-10): renew it to cover verification.  If it is no longer
+            # ours (a concurrent `relay recover` reclaimed it), stop: the
+            # workspace is not owned, so verifying it would prove nothing.
+            if not _renew(state, execution.execution_id):
+                _lease_lost(state, task.task_id)
+            try:
+                state.update_task_status(
+                    task.task_id, TaskStatus.VERIFYING, validate_transition=True
+                )
+            except InvalidTransitionError:
+                _lease_lost(state, task.task_id)
             audit.verification_started(task.task_id, execution.execution_id)
 
-            result = verifier.verify(task, execution)
+            try:
+                result = verifier.verify(task, execution)
+            except BaseException as exc:
+                # Batch 3 (E-7): never leave the task VERIFYING with no lease.
+                # Release the lease, then move the task to RECOVERY_REQUIRED so
+                # 'relay recover' / 'relay accept-recovery' can handle it.
+                reason = f"Verification aborted: {type(exc).__name__}: {exc}"
+                engine.release_workspace_lease(execution.execution_id)
+                try:
+                    state.mark_orphaned_task_atomic(task.task_id, reason)
+                except Exception as mark_exc:  # e.g. database busy
+                    print(f"Could not record RECOVERY_REQUIRED now ({mark_exc}); "
+                          "'relay recover' will pick the task up.", file=sys.stderr)
+                print(
+                    f"Task {task.task_id}: RECOVERY_REQUIRED - {reason}. "
+                    "No verification result was recorded. Review the workspace, "
+                    f"then run: relay accept-recovery {task.task_id} --actor <name>",
+                    file=sys.stderr,
+                )
+                if isinstance(exc, KeyboardInterrupt):
+                    raise
+                sys.exit(1)
+            # Batch 3 (E-10): confirm the workspace is still ours before recording
+            # an outcome; a verdict on a workspace we no longer own proves nothing.
+            if not _renew(state, execution.execution_id):
+                _lease_lost(state, task.task_id)
             audit.verification_completed(
                 task.task_id, execution.execution_id, result.passed, result.as_dict()
             )
@@ -197,6 +250,15 @@ def cmd_run_task(args) -> None:
                 print(f"Task {task.task_id}: FAILED - {reason}", file=sys.stderr)
                 sys.exit(1)
 
+        elif execution.status.value == "FAILED" and execution.ownership_denied:
+            # Batch 3 (E-9): this attempt never owned the task (another execution
+            # holds the workspace, or the task stopped being READY).  Change nothing.
+            print(
+                f"Task {task.task_id}: {execution.error} No state was changed.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
         elif execution.status.value == "FAILED":
             # Pre-launch failure: the worker was never launched (exit_code is None).
             # Verifying the unchanged baseline workspace could produce a false
@@ -204,9 +266,20 @@ def cmd_run_task(args) -> None:
             # P1-J: READY→FAILED is now in ALLOWED_TRANSITIONS, so validate_transition=True
             # is correct for both READY and RUNNING pre-launch failure paths.
             reason = execution.error or "Worker was not launched."
-            state.update_task_status(
-                task.task_id, TaskStatus.FAILED, error=reason, validate_transition=True
-            )
+            # Batch 3: compare-and-set from the status this attempt owns, so a
+            # concurrent run that has since claimed the task is never failed.
+            owned = TaskStatus.RUNNING if execution.task_claimed else TaskStatus.READY
+            if not state.compare_and_set_status(
+                task.task_id, owned, TaskStatus.FAILED, error=reason
+            ):
+                current = state.get_task(task.task_id)
+                print(
+                    f"Task {task.task_id}: pre-launch failure ({reason}), but the task "
+                    f"is now {current.status.value if current else 'missing'}, owned by "
+                    "another run. No state was changed.",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
             audit.task_failed(task.task_id, reason)
             if not keep_workspace and execution.workspace:
                 engine.cleanup_workspace(execution.workspace, workspace_base)
@@ -455,8 +528,13 @@ def cmd_accept_recovery(args) -> None:
         if e.status == ExecutionStatus.INTERRUPTED
     ]
 
-    if interrupted and current_ws.exists():
-        exec_id = interrupted[0].execution_id
+    # Batch 3: move the workspace aside whenever it exists, not only after an
+    # INTERRUPTED execution — a task orphaned by an aborted verification has a
+    # COMPLETED/FAILED execution, and its workspace is what the operator was
+    # asked to review.  The next run would otherwise delete it.
+    source = interrupted[0] if interrupted else (executions[-1] if executions else None)
+    if source is not None and current_ws.exists():
+        exec_id = source.execution_id
         renamed = workspace_base / f"{args.task_id}.interrupted.{exec_id[:8]}"
         try:
             assert_within_workspace(current_ws, workspace_base)
@@ -467,7 +545,15 @@ def cmd_accept_recovery(args) -> None:
             print(f"Workspace boundary violation: {exc}", file=sys.stderr)
             sys.exit(1)
         except OSError as exc:
-            print(f"Warning: workspace rename failed: {exc}", file=sys.stderr)
+            # Batch 3: do not proceed if the interrupted workspace cannot be moved
+            # aside — the next run would delete it, and a still-running worker
+            # process may be holding it.
+            print(
+                f"Cannot move the interrupted workspace aside: {exc}. Make sure no "
+                "worker process is still using it, then retry. No state was changed.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
 
     try:
         state.accept_recovery_atomic(args.task_id, actor=args.actor)

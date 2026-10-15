@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -51,6 +53,18 @@ class PolicyResult:
     denied_capabilities: list[str] = field(default_factory=list)
     denied_actions: list[str] = field(default_factory=list)
     requires_approval: bool = False
+
+
+_SAFE_REF = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,254}")
+
+
+def _is_safe_ref(ref: str) -> bool:
+    return (
+        _SAFE_REF.fullmatch(ref) is not None
+        and ".." not in ref
+        and "//" not in ref
+        and not ref.endswith(("/", ".", ".lock"))
+    )
 
 
 class PolicyEngine:
@@ -130,6 +144,19 @@ class PolicyEngine:
             return PolicyResult(
                 allowed=False,
                 reason=f"Invalid required_tests entry: {exc}",
+            )
+
+        # Batch 3 (E-12): base_ref is passed to `git checkout`; allow only plain
+        # branch/tag names so it can never be read as an option or a revision
+        # expression.
+        if not _is_safe_ref(task.base_ref):
+            return PolicyResult(
+                allowed=False,
+                reason=(
+                    f"Invalid base_ref {task.base_ref!r}: use a plain branch or tag "
+                    "name (letters, digits, '.', '_', '-', '/'; no leading '-', "
+                    "'..', '//' or trailing '/' or '.lock')."
+                ),
             )
 
         # Batch 1: declared new files must be plain workspace-relative paths.

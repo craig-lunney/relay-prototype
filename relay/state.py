@@ -259,6 +259,30 @@ class StateManager:
             )
             conn.commit()
 
+    def compare_and_set_status(
+        self,
+        task_id: str,
+        expected: TaskStatus,
+        new_status: TaskStatus,
+        error: str | None = None,
+    ) -> bool:
+        """Move task_id from *expected* to *new_status*, or change nothing.
+
+        Batch 3: unlike update_task_status (which validates against whatever the
+        current status is), this only succeeds if the task is still exactly in
+        the status the caller owns.  Returns False — with no write — otherwise.
+        """
+        if new_status not in ALLOWED_TRANSITIONS.get(expected, frozenset()):
+            raise InvalidTransitionError(
+                f"Transition {expected.value} → {new_status.value} is not allowed."
+            )
+        cursor = self._conn().execute(
+            "UPDATE tasks SET status=?, error=?, updated_at=? WHERE task_id=? AND status=?",
+            (new_status.value, error, _now_iso(), task_id, expected.value),
+        )
+        self._conn().commit()
+        return cursor.rowcount == 1
+
     def increment_attempt_count(self, task_id: str) -> None:
         self._conn().execute(
             "UPDATE tasks SET attempt_count=attempt_count+1, updated_at=? WHERE task_id=?",
@@ -356,7 +380,8 @@ class StateManager:
 
     def get_executions_for_task(self, task_id: str) -> list[Execution]:
         rows = self._conn().execute(
-            "SELECT * FROM executions WHERE task_id=? ORDER BY attempt_number",
+            "SELECT * FROM executions WHERE task_id=? "
+            "ORDER BY attempt_number, started_at, rowid",
             (task_id,),
         ).fetchall()
         return [self._row_to_execution(r) for r in rows]
@@ -430,6 +455,26 @@ class StateManager:
             (execution_id,),
         )
         self._conn().commit()
+
+    def renew_lease(self, execution_id: str, expires_at: datetime) -> bool:
+        """Extend an active lease (Batch 3, E-10).  Returns False if the lease is
+        no longer active — e.g. `relay recover` reclaimed it — in which case the
+        caller no longer owns the workspace and must not continue."""
+        cursor = self._conn().execute(
+            "UPDATE execution_leases SET expires_at=? "
+            "WHERE execution_id=? AND released=0",
+            (expires_at.isoformat(), execution_id),
+        )
+        self._conn().commit()
+        return cursor.rowcount == 1
+
+    def get_tasks_by_status(self, statuses: list[TaskStatus]) -> list[Task]:
+        placeholders = ",".join("?" for _ in statuses)
+        rows = self._conn().execute(
+            f"SELECT * FROM tasks WHERE status IN ({placeholders}) ORDER BY created_at",
+            [s.value for s in statuses],
+        ).fetchall()
+        return [self._row_to_task(r) for r in rows]
 
     def get_active_lease(self, workspace: str) -> ExecutionLease | None:
         row = self._conn().execute(
@@ -829,7 +874,8 @@ class StateManager:
         self,
         execution_id: str,
         actor: str = "relay",
-    ) -> None:
+        expected_expires_at: datetime | None = None,
+    ) -> bool:
         """Atomically handle database changes when recovery finds a stale lease.
 
         Within a single transaction:
@@ -844,16 +890,33 @@ class StateManager:
         the same execution_id are no-ops on state (because of CAS guards and
         the released=0 condition on the lease) and each call records its own
         audit event.
+
+        Batch 3 (E-10): when *expected_expires_at* is given (the expiry the
+        recovery scan observed), nothing is changed unless the lease is still
+        active with exactly that expiry.  A lease renewed by `relay run-task`
+        after the scan read it is therefore never reclaimed.  Returns True if
+        the stale lease was handled.
         """
         conn = self._conn()
         now = _now_iso()
         with conn:
+            conn.execute("BEGIN IMMEDIATE")
+            if expected_expires_at is not None:
+                lease_row = conn.execute(
+                    "SELECT expires_at FROM execution_leases "
+                    "WHERE execution_id=? AND released=0",
+                    (execution_id,),
+                ).fetchone()
+                if lease_row is None or (
+                    _parse_dt(lease_row["expires_at"]) != expected_expires_at
+                ):
+                    return False
             ex_row = conn.execute(
                 "SELECT task_id, status FROM executions WHERE execution_id=?",
                 (execution_id,),
             ).fetchone()
             if ex_row is None:
-                return
+                return False
             task_id = ex_row["task_id"]
             ex_status = ExecutionStatus(ex_row["status"])
 
@@ -914,6 +977,79 @@ class StateManager:
                     }),
                 ),
             )
+        return True
+
+    def mark_orphaned_task_atomic(
+        self,
+        task_id: str,
+        reason: str,
+        actor: str = "relay",
+    ) -> bool:
+        """Move a RUNNING/VERIFYING task with no active lease to RECOVERY_REQUIRED.
+
+        Batch 3 (E-7): a task can be left RUNNING or VERIFYING after its lease is
+        gone (verifier exception, interrupted CLI).  Lease-based recovery cannot
+        see it.  In one transaction this re-checks that no active lease exists
+        for the task (so a live execution is never touched), transitions the task
+        via CAS, marks still-RUNNING executions INTERRUPTED, and emits a
+        RECOVERY_REQUIRED event.  Returns True only if the task transitioned.
+        """
+        conn = self._conn()
+        now = _now_iso()
+        with conn:
+            # IMMEDIATE: the "no active lease" check below and the update are one
+            # serialised unit; no lease can be acquired between them.
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT status FROM tasks WHERE task_id=?", (task_id,)
+            ).fetchone()
+            if row is None:
+                return False
+            current = TaskStatus(row["status"])
+            if current not in (TaskStatus.RUNNING, TaskStatus.VERIFYING):
+                return False
+            active = conn.execute(
+                "SELECT COUNT(*) FROM execution_leases WHERE task_id=? AND released=0",
+                (task_id,),
+            ).fetchone()[0]
+            if active:
+                return False
+            cursor = conn.execute(
+                "UPDATE tasks SET status=?, error=?, updated_at=? "
+                "WHERE task_id=? AND status=?",
+                (TaskStatus.RECOVERY_REQUIRED.value, reason, now, task_id, current.value),
+            )
+            if cursor.rowcount == 0:
+                return False
+            conn.execute(
+                "UPDATE executions SET status=?, error=?, ended_at=? "
+                "WHERE task_id=? AND status=?",
+                (ExecutionStatus.INTERRUPTED.value, reason, now, task_id,
+                 ExecutionStatus.RUNNING.value),
+            )
+            latest = conn.execute(
+                "SELECT execution_id FROM executions WHERE task_id=? "
+                "ORDER BY attempt_number DESC, started_at DESC LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            seq = conn.execute(
+                "SELECT COALESCE(MAX(sequence), 0) FROM events"
+            ).fetchone()[0] + 1
+            conn.execute(
+                """
+                INSERT INTO events
+                    (event_id, sequence, event_type, task_id, execution_id,
+                     timestamp, actor, details)
+                VALUES (?,?,?,?,?,?,?,?)
+                """,
+                (
+                    AuditEvent.new_id(), seq,
+                    AuditEventType.RECOVERY_REQUIRED.value,
+                    task_id, latest["execution_id"] if latest else None, now, actor,
+                    json.dumps({"previous_status": current.value, "reason": reason}),
+                ),
+            )
+            return True
 
     def pre_launch_failed_atomic(
         self,
