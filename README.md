@@ -103,6 +103,12 @@ CREATED → VALIDATING → READY → RUNNING → VERIFYING → COMPLETED
 
 Relay owns all transitions. Claude cannot declare a task COMPLETED.
 
+Since Batch 1, a task whose automated verification passes but which has
+acceptance criteria Relay cannot check enters `ACCEPTANCE_REQUIRED` and needs
+`relay acknowledge-criteria` before it is COMPLETED. Verification also fails if
+the worker alters protected tests or test configuration. See
+[docs/verification-integrity.md](docs/verification-integrity.md).
+
 ---
 
 ## Quick start

@@ -21,6 +21,9 @@ class TaskStatus(str, Enum):
     REJECTED = "REJECTED"
     INPUT_REQUIRED = "INPUT_REQUIRED"
     RECOVERY_REQUIRED = "RECOVERY_REQUIRED"
+    # Batch 1 (D5): automated verification passed, but one or more acceptance
+    # criteria are UNVERIFIED and await explicit human acknowledgement.
+    ACCEPTANCE_REQUIRED = "ACCEPTANCE_REQUIRED"
 
 
 class ExecutionStatus(str, Enum):
@@ -56,6 +59,9 @@ class AuditEventType(str, Enum):
     RECOVERY_ACCEPTED = "RECOVERY_ACCEPTED"
     TASK_RETRIED = "TASK_RETRIED"
     RECOVERY_SCAN_STALE_LEASE = "RECOVERY_SCAN_STALE_LEASE"
+    ACCEPTANCE_REQUIRED = "ACCEPTANCE_REQUIRED"
+    ACCEPTANCE_ACKNOWLEDGED = "ACCEPTANCE_ACKNOWLEDGED"
+    ACCEPTANCE_REJECTED = "ACCEPTANCE_REJECTED"
 
 
 # Relay owns all state transitions. Agents cannot declare their own status.
@@ -67,7 +73,8 @@ ALLOWED_TRANSITIONS: dict[TaskStatus, frozenset[TaskStatus]] = {
     TaskStatus.RUNNING:           frozenset({TaskStatus.VERIFYING, TaskStatus.FAILED,
                                              TaskStatus.TIMEOUT, TaskStatus.RECOVERY_REQUIRED}),
     TaskStatus.VERIFYING:         frozenset({TaskStatus.COMPLETED, TaskStatus.FAILED,
-                                             TaskStatus.RECOVERY_REQUIRED}),
+                                             TaskStatus.RECOVERY_REQUIRED,
+                                             TaskStatus.ACCEPTANCE_REQUIRED}),
     TaskStatus.COMPLETED:         frozenset(),
     TaskStatus.FAILED:            frozenset(),
     TaskStatus.BLOCKED:           frozenset({TaskStatus.READY, TaskStatus.CANCELLED, TaskStatus.REJECTED}),
@@ -77,6 +84,9 @@ ALLOWED_TRANSITIONS: dict[TaskStatus, frozenset[TaskStatus]] = {
     TaskStatus.INPUT_REQUIRED:    frozenset({TaskStatus.READY, TaskStatus.CANCELLED}),
     TaskStatus.RECOVERY_REQUIRED: frozenset({TaskStatus.READY, TaskStatus.CANCELLED,
                                              TaskStatus.FAILED}),
+    # Left only by an explicit human decision (relay acknowledge-criteria).
+    TaskStatus.ACCEPTANCE_REQUIRED: frozenset({TaskStatus.COMPLETED, TaskStatus.FAILED,
+                                               TaskStatus.CANCELLED}),
 }
 
 
@@ -97,6 +107,10 @@ class Task:
     # P1-J: authorised deletions within required_tests scope (operator-declared).
     # Prevents false-failure when a task legitimately removes a test.
     expected_deleted_tests: list[str] = field(default_factory=list)
+    # Batch 1: workspace-relative paths the worker is expected to create.
+    # Any other new (non-cache) file fails verification.  This cannot authorise
+    # protected additions such as conftest.py or pytest configuration.
+    expected_new_files: list[str] = field(default_factory=list)
     status: TaskStatus = TaskStatus.CREATED
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
@@ -142,6 +156,12 @@ class Execution:
     baseline_tests_collected: list[str] = field(default_factory=list)
     baseline_test_exit: int | None = None
     baseline_test_output: str = ""
+    # Batch 1: Relay-captured workspace integrity manifest (WorkspaceSnapshot
+    # JSON), taken after baseline collection and before the worker launches.
+    # baseline_manifest_error records a capture failure so verification can
+    # fail closed rather than silently skip the integrity check.
+    baseline_manifest: str | None = None
+    baseline_manifest_error: str | None = None
 
     @classmethod
     def new_id(cls) -> str:

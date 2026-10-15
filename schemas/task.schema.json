@@ -50,7 +50,7 @@
     "acceptance_criteria": {
       "type": "array",
       "items": { "type": "string" },
-      "description": "Deterministically verifiable criteria that must be met for COMPLETED."
+      "description": "Criteria reported as PASS, FAIL or UNVERIFIED. Only recognised test-suite criteria are checked automatically; any other criterion is UNVERIFIED and requires explicit human acknowledgement before COMPLETED."
     },
     "requested_actions": {
       "type": "array",
@@ -69,6 +69,12 @@
       "type": "array",
       "items": { "type": "string" },
       "description": "Test files or patterns that Relay's verifier must run independently."
+    },
+    "expected_new_files": {
+      "type": "array",
+      "items": { "type": "string" },
+      "default": [],
+      "description": "Workspace-relative paths the worker is expected to create. Any other new file fails verification. Cannot authorise protected additions (conftest.py, pytest configuration, start-up hooks)."
     },
     "approval_policy": {
       "type": "string",

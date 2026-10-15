@@ -178,6 +178,12 @@ class AuditLog:
     def task_completed(self, task_id: str) -> AuditEvent:
         return self._emit(AuditEventType.TASK_COMPLETED, task_id, {})
 
+    def acceptance_required(self, task_id: str, criteria: list[str]) -> AuditEvent:
+        """Batch 1 (D5): verification passed; UNVERIFIED criteria await a human."""
+        return self._emit(AuditEventType.ACCEPTANCE_REQUIRED, task_id, {
+            "unverified_criteria": criteria,
+        })
+
     def task_failed(self, task_id: str, reason: str) -> AuditEvent:
         return self._emit(AuditEventType.TASK_FAILED, task_id, {"reason": reason})
 

@@ -3,7 +3,12 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
-from .paths import InvalidTestSpecifierError, validate_required_tests
+from .paths import (
+    InvalidRelativePathError,
+    InvalidTestSpecifierError,
+    normalize_relative_path,
+    validate_required_tests,
+)
 
 if TYPE_CHECKING:
     from .state import StateManager
@@ -125,6 +130,16 @@ class PolicyEngine:
             return PolicyResult(
                 allowed=False,
                 reason=f"Invalid required_tests entry: {exc}",
+            )
+
+        # Batch 1: declared new files must be plain workspace-relative paths.
+        try:
+            for path in task.expected_new_files:
+                normalize_relative_path(path)
+        except InvalidRelativePathError as exc:
+            return PolicyResult(
+                allowed=False,
+                reason=f"Invalid expected_new_files entry: {exc}",
             )
 
         # P1-F: signal that manual human approval is required before execution.

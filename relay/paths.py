@@ -12,6 +12,10 @@ class InvalidTestSpecifierError(Exception):
     """Raised when a required_tests entry fails validation."""
 
 
+class InvalidRelativePathError(Exception):
+    """Raised when a declared workspace-relative path fails validation."""
+
+
 # Characters that must not appear in a pytest test specifier.
 # These are shell control characters that could cause confusion in log output,
 # command strings, or argument parsing, and are never valid in file paths or
@@ -152,3 +156,31 @@ def validate_required_tests(
     for spec in required_tests:
         validate_test_specifier(spec, workspace)
     return required_tests
+
+
+def normalize_relative_path(path: str) -> str:
+    """
+    Validate and normalise a declared workspace-relative file path
+    (Batch 1: Task.expected_new_files) to the POSIX form used by the
+    integrity manifest, e.g. ``docs\notes.md`` -> ``docs/notes.md``.
+
+    Raises InvalidRelativePathError if the path is empty, absolute, contains a
+    drive letter, a ``..`` component, or control/shell characters.  Matching is
+    exact: no globs are interpreted.
+    """
+    if not path or not path.strip():
+        raise InvalidRelativePathError("Path must not be empty.")
+    if _FORBIDDEN_CHARS.search(path) or any(c in path for c in "*?[]"):
+        raise InvalidRelativePathError(
+            f"Path {path!r} contains shell metacharacters, control characters "
+            "or glob characters."
+        )
+    posix = path.replace("\\", "/")
+    if posix.startswith("/") or re.match(r"^[A-Za-z]:", posix):
+        raise InvalidRelativePathError(f"Path {path!r} must be workspace-relative.")
+    parts = [part for part in posix.split("/") if part not in ("", ".")]
+    if not parts or ".." in parts:
+        raise InvalidRelativePathError(
+            f"Path {path!r} must name a file inside the workspace."
+        )
+    return "/".join(parts)

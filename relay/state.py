@@ -70,6 +70,7 @@ class StateManager:
                 forbidden_actions      TEXT NOT NULL,
                 required_tests         TEXT NOT NULL,
                 expected_deleted_tests TEXT NOT NULL DEFAULT '[]',
+                expected_new_files     TEXT NOT NULL DEFAULT '[]',
                 approval_policy        TEXT NOT NULL,
                 status                 TEXT NOT NULL,
                 protocol_version       TEXT NOT NULL DEFAULT '0.1',
@@ -98,7 +99,9 @@ class StateManager:
                 report                    TEXT,
                 baseline_tests_collected  TEXT NOT NULL DEFAULT '[]',
                 baseline_test_exit        INTEGER,
-                baseline_test_output      TEXT NOT NULL DEFAULT ''
+                baseline_test_output      TEXT NOT NULL DEFAULT '',
+                baseline_manifest         TEXT,
+                baseline_manifest_error   TEXT
             );
 
             CREATE TABLE IF NOT EXISTS execution_leases (
@@ -152,6 +155,10 @@ class StateManager:
             "ALTER TABLE executions ADD COLUMN baseline_tests_collected TEXT NOT NULL DEFAULT '[]'",
             "ALTER TABLE executions ADD COLUMN baseline_test_exit INTEGER",
             "ALTER TABLE executions ADD COLUMN baseline_test_output TEXT NOT NULL DEFAULT ''",
+            # Batch 1: verification integrity.
+            "ALTER TABLE tasks ADD COLUMN expected_new_files TEXT NOT NULL DEFAULT '[]'",
+            "ALTER TABLE executions ADD COLUMN baseline_manifest TEXT",
+            "ALTER TABLE executions ADD COLUMN baseline_manifest_error TEXT",
         ):
             try:
                 conn.execute(stmt)
@@ -169,10 +176,10 @@ class StateManager:
                 task_id, project_id, repository, base_ref, working_ref,
                 objective, requirements, acceptance_criteria,
                 requested_actions, forbidden_actions, required_tests,
-                expected_deleted_tests, approval_policy, status, protocol_version,
-                max_execution_attempts, attempt_count, error,
+                expected_deleted_tests, expected_new_files, approval_policy, status,
+                protocol_version, max_execution_attempts, attempt_count, error,
                 created_at, updated_at
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 task.task_id, task.project_id, task.repository,
@@ -183,6 +190,7 @@ class StateManager:
                 json.dumps(task.forbidden_actions),
                 json.dumps(task.required_tests),
                 json.dumps(task.expected_deleted_tests),
+                json.dumps(task.expected_new_files),
                 task.approval_policy, task.status.value,
                 task.protocol_version, task.max_execution_attempts,
                 task.attempt_count, task.error,
@@ -272,6 +280,7 @@ class StateManager:
             forbidden_actions=json.loads(row["forbidden_actions"]),
             required_tests=json.loads(row["required_tests"]),
             expected_deleted_tests=json.loads(row["expected_deleted_tests"] or "[]"),
+            expected_new_files=json.loads(row["expected_new_files"] or "[]"),
             approval_policy=row["approval_policy"],
             status=TaskStatus(row["status"]),
             protocol_version=row["protocol_version"],
@@ -292,8 +301,9 @@ class StateManager:
                 execution_id, task_id, attempt_number, status, workspace,
                 worker_identity, policy_version, capability_snapshot,
                 started_at, ended_at, exit_code, stdout, stderr, error, report,
-                baseline_tests_collected, baseline_test_exit, baseline_test_output
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                baseline_tests_collected, baseline_test_exit, baseline_test_output,
+                baseline_manifest, baseline_manifest_error
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 execution.execution_id, execution.task_id, execution.attempt_number,
@@ -307,6 +317,8 @@ class StateManager:
                 json.dumps(execution.baseline_tests_collected),
                 execution.baseline_test_exit,
                 execution.baseline_test_output,
+                execution.baseline_manifest,
+                execution.baseline_manifest_error,
             ),
         )
         conn.commit()
@@ -316,7 +328,8 @@ class StateManager:
             """
             UPDATE executions SET
                 status=?, ended_at=?, exit_code=?, stdout=?, stderr=?, error=?, report=?,
-                baseline_tests_collected=?, baseline_test_exit=?, baseline_test_output=?
+                baseline_tests_collected=?, baseline_test_exit=?, baseline_test_output=?,
+                baseline_manifest=?, baseline_manifest_error=?
             WHERE execution_id=?
             """,
             (
@@ -328,6 +341,8 @@ class StateManager:
                 json.dumps(execution.baseline_tests_collected),
                 execution.baseline_test_exit,
                 execution.baseline_test_output,
+                execution.baseline_manifest,
+                execution.baseline_manifest_error,
                 execution.execution_id,
             ),
         )
@@ -372,6 +387,8 @@ class StateManager:
             baseline_tests_collected=json.loads(row["baseline_tests_collected"] or "[]"),
             baseline_test_exit=row["baseline_test_exit"],
             baseline_test_output=row["baseline_test_output"] or "",
+            baseline_manifest=row["baseline_manifest"],
+            baseline_manifest_error=row["baseline_manifest_error"],
         )
 
     # ── Leases ────────────────────────────────────────────────────────────────
@@ -731,6 +748,80 @@ class StateManager:
                     AuditEventType.TASK_RETRIED.value,
                     task_id, None, now, actor,
                     json.dumps({"attempt_count": attempt_count}),
+                ),
+            )
+
+    def acknowledge_acceptance_atomic(
+        self,
+        task_id: str,
+        actor: str,
+        criteria: list[str],
+        accept: bool,
+        reason: str | None = None,
+    ) -> None:
+        """Atomically record a human decision on UNVERIFIED acceptance criteria.
+
+        Batch 1 (D5): ACCEPTANCE_REQUIRED → COMPLETED (accept) or → FAILED
+        (reject), with an ACCEPTANCE_ACKNOWLEDGED / ACCEPTANCE_REJECTED event in
+        the same transaction.  The event records the human decision only; the
+        automated verdicts in VERIFICATION_COMPLETED are never rewritten, so an
+        UNVERIFIED criterion stays UNVERIFIED in the record.
+
+        Raises InvalidTransitionError if the task is not ACCEPTANCE_REQUIRED or a
+        concurrent writer changed its status first.
+        """
+        conn = self._conn()
+        now = _now_iso()
+        new_status = TaskStatus.COMPLETED if accept else TaskStatus.FAILED
+        event_type = (
+            AuditEventType.ACCEPTANCE_ACKNOWLEDGED if accept
+            else AuditEventType.ACCEPTANCE_REJECTED
+        )
+        error = None if accept else (
+            f"Acceptance rejected by {actor!r}: {reason or 'no reason given'}"
+        )
+        with conn:
+            row = conn.execute(
+                "SELECT status FROM tasks WHERE task_id=?", (task_id,)
+            ).fetchone()
+            if row is None:
+                raise InvalidTransitionError(f"Task {task_id!r} not found.")
+            current = TaskStatus(row["status"])
+            if current != TaskStatus.ACCEPTANCE_REQUIRED:
+                raise InvalidTransitionError(
+                    f"acknowledge_acceptance_atomic: task {task_id!r} is "
+                    f"{current.value!r}, expected ACCEPTANCE_REQUIRED."
+                )
+            cursor = conn.execute(
+                "UPDATE tasks SET status=?, error=?, updated_at=? "
+                "WHERE task_id=? AND status=?",
+                (new_status.value, error, now, task_id,
+                 TaskStatus.ACCEPTANCE_REQUIRED.value),
+            )
+            if cursor.rowcount == 0:
+                raise InvalidTransitionError(
+                    f"Concurrent modification: task {task_id!r} status changed "
+                    f"during ACCEPTANCE_REQUIRED → {new_status.value} transition."
+                )
+            seq = conn.execute(
+                "SELECT COALESCE(MAX(sequence), 0) FROM events"
+            ).fetchone()[0] + 1
+            conn.execute(
+                """
+                INSERT INTO events
+                    (event_id, sequence, event_type, task_id, execution_id,
+                     timestamp, actor, details)
+                VALUES (?,?,?,?,?,?,?,?)
+                """,
+                (
+                    AuditEvent.new_id(), seq, event_type.value,
+                    task_id, None, now, actor,
+                    json.dumps({
+                        "criteria": criteria,
+                        "decision": "ACCEPTED" if accept else "REJECTED",
+                        "reason": reason,
+                        "human_acknowledgement": True,
+                    }),
                 ),
             )
 

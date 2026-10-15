@@ -14,7 +14,7 @@ from .policy import PolicyEngine
 from .recovery import RecoveryEngine
 from .schemas import ValidationError, validate_task_input
 from .state import InvalidTransitionError, StateManager
-from .verifier import Verifier
+from .verifier import AC_UNVERIFIED, Verifier, unverified_criteria
 
 
 def _make_components(db_path: str):
@@ -52,6 +52,7 @@ def cmd_create_task(args) -> None:
         forbidden_actions=task_def.get("forbidden_actions", []),
         required_tests=task_def.get("required_tests", []),
         expected_deleted_tests=task_def.get("expected_deleted_tests", []),
+        expected_new_files=task_def.get("expected_new_files", []),
         approval_policy=task_def.get("approval_policy", "auto"),
         status=TaskStatus.CREATED,
     )
@@ -135,7 +136,29 @@ def cmd_run_task(args) -> None:
                 task.task_id, execution.execution_id, result.passed, result.as_dict()
             )
 
-            if result.passed:
+            unverified = [
+                c for c, verdict in result.acceptance_results.items()
+                if verdict == AC_UNVERIFIED
+            ]
+            if result.passed and unverified:
+                # Batch 1 (D5): automated verification passed, but some criteria
+                # were not established by it.  The task is not COMPLETED until a
+                # human explicitly acknowledges them.  The workspace is kept so
+                # the operator can inspect the work before deciding.
+                state.update_task_status(
+                    task.task_id, TaskStatus.ACCEPTANCE_REQUIRED, validate_transition=True
+                )
+                audit.acceptance_required(task.task_id, unverified)
+                print(f"Task {task.task_id}: ACCEPTANCE_REQUIRED "
+                      "(automated verification passed; human acknowledgement needed)")
+                print("Criteria not verified automatically:")
+                for criterion in unverified:
+                    print(f"  - {criterion}")
+                if execution.workspace:
+                    print(f"Workspace kept for inspection: {execution.workspace}")
+                print(f"Run: relay acknowledge-criteria {task.task_id} --actor <name> "
+                      "[--reject] [--reason <text>]")
+            elif result.passed:
                 state.update_task_status(
                     task.task_id, TaskStatus.COMPLETED, validate_transition=True
                 )
@@ -278,6 +301,47 @@ def cmd_reject_task(args) -> None:
     print(f"Status:      REJECTED")
 
 
+def cmd_acknowledge_criteria(args) -> None:
+    """Record a human decision on UNVERIFIED acceptance criteria (Batch 1, D5).
+
+    This is a human acknowledgement, not an automated pass: the verification
+    record keeps every UNVERIFIED verdict unchanged, and the decision is stored
+    as a separate ACCEPTANCE_ACKNOWLEDGED / ACCEPTANCE_REJECTED audit event
+    attributed to --actor.  Only tasks whose automated verification passed can
+    be in ACCEPTANCE_REQUIRED, so a FAILED criterion can never be acknowledged.
+    """
+    state, _, _ = _make_components(args.db)
+    task = state.get_task(args.task_id)
+
+    if task is None:
+        print(f"Task {args.task_id} not found.", file=sys.stderr)
+        sys.exit(1)
+    if task.status != TaskStatus.ACCEPTANCE_REQUIRED:
+        print(
+            f"Task {args.task_id} is {task.status.value}. Only ACCEPTANCE_REQUIRED "
+            "tasks have criteria awaiting acknowledgement. No state was changed.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    criteria = unverified_criteria(task)
+    accept = not args.reject
+    try:
+        state.acknowledge_acceptance_atomic(
+            task.task_id, actor=args.actor, criteria=criteria,
+            accept=accept, reason=args.reason,
+        )
+    except InvalidTransitionError as exc:
+        print(f"Acknowledgement failed: {exc}. No state was changed.", file=sys.stderr)
+        sys.exit(1)
+
+    decision = "accepted" if accept else "rejected"
+    print(f"Task {task.task_id}: criteria {decision} by {args.actor}.")
+    for criterion in criteria:
+        print(f"  - {criterion} (UNVERIFIED by Relay; human-{decision})")
+    print(f"Status: {'COMPLETED' if accept else 'FAILED'}")
+
+
 def cmd_status(args) -> None:
     state, _, _ = _make_components(args.db)
     task = state.get_task(args.task_id)
@@ -290,6 +354,10 @@ def cmd_status(args) -> None:
     print(f"Attempts:   {task.attempt_count}/{task.max_execution_attempts}")
     print(f"Repository: {task.repository}")
     print(f"Objective:  {task.objective}")
+    if task.status == TaskStatus.ACCEPTANCE_REQUIRED:
+        print("Awaiting human acknowledgement of criteria not verified automatically:")
+        for criterion in unverified_criteria(task):
+            print(f"  - {criterion}")
 
     executions = state.get_executions_for_task(args.task_id)
     if executions:
@@ -471,6 +539,19 @@ def main() -> None:
     p.add_argument("--actor", required=True, help="Identity of the rejecting operator")
     p.add_argument("--reason", default=None, help="Optional reason for rejection")
     p.set_defaults(func=cmd_reject_task)
+
+    p = sub.add_parser(
+        "acknowledge-criteria",
+        help="Record a human decision on UNVERIFIED criteria of an ACCEPTANCE_REQUIRED task",
+    )
+    p.add_argument("task_id")
+    p.add_argument("--actor", required=True, help="Identity of the acknowledging operator")
+    p.add_argument(
+        "--reject", action="store_true", default=False,
+        help="Reject the outcome instead of accepting it (task becomes FAILED)",
+    )
+    p.add_argument("--reason", default=None, help="Optional reason for the decision")
+    p.set_defaults(func=cmd_acknowledge_criteria)
 
     p = sub.add_parser("status", help="Show task status and execution history")
     p.add_argument("task_id")

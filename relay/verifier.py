@@ -1,13 +1,68 @@
 from __future__ import annotations
 
+import re
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from .executor import _worker_environment
+from .integrity import IntegrityReport, WorkspaceSnapshot, compare_snapshots, snapshot_workspace
 from .models import Execution, Task
-from .paths import InvalidTestSpecifierError, WorkspaceBoundaryError, validate_required_tests
+from .paths import (
+    InvalidRelativePathError,
+    InvalidTestSpecifierError,
+    WorkspaceBoundaryError,
+    normalize_relative_path,
+    validate_required_tests,
+)
 from .testing import collect_tests, parse_test_results, run_test_suite
+
+# ── Acceptance-criterion verdicts (Batch 1, D5) ───────────────────────────────
+# PASS        checked by Relay and satisfied.
+# FAIL        checked by Relay and not satisfied (or the check could not run
+#             because verification had already failed).
+# UNVERIFIED  not established by automated verification.  Needs an explicit
+#             human acknowledgement before the task can be COMPLETED; the
+#             acknowledgement is recorded separately and never changes this
+#             verdict.
+AC_PASS = "PASS"
+AC_FAIL = "FAIL"
+AC_UNVERIFIED = "UNVERIFIED"
+
+# The only criteria Relay checks automatically: statements that the required
+# test suite passes, matched as whole (normalised) strings.  Matching is
+# deliberately exact rather than by keyword: a criterion such as "add a
+# regression test for X; all tests pass" asserts more than the suite result, so
+# it must be UNVERIFIED rather than marked PASS on the strength of the suite.
+# Classification depends only on the operator-authored task text, never on
+# worker output, so a worker cannot move a criterion from FAIL to UNVERIFIED.
+_TEST_SUITE_CRITERIA = frozenset({
+    "all tests pass",
+    "all tests must pass",
+    "all tests passing",
+    "all required tests pass",
+    "all required tests must pass",
+    "tests pass",
+    "the test suite passes",
+    "test suite passes",
+    "the full test suite passes",
+    "full test suite passes",
+    "no failing tests",
+    "no test failures",
+    "tests must not fail",
+})
+
+
+def is_automatically_verifiable(criterion: str) -> bool:
+    """True if Relay checks *criterion* itself (a required-test-suite criterion)."""
+    normalised = re.sub(r"\s+", " ", criterion.strip().lower()).rstrip(".")
+    return normalised in _TEST_SUITE_CRITERIA
+
+
+def unverified_criteria(task: Task) -> list[str]:
+    """Criteria of *task* that automated verification never establishes."""
+    return [c for c in dict.fromkeys(task.acceptance_criteria)
+            if not is_automatically_verifiable(c)]
 
 
 @dataclass
@@ -25,7 +80,7 @@ class VerificationResult:
     unexpected_files: list[str]
     test_exit_code: int | None
     test_output: str
-    acceptance_results: dict[str, bool]
+    acceptance_results: dict[str, str]
     report_agreement: dict[str, bool]
     errors: list[str]
     # P1-J: test accountability fields
@@ -35,6 +90,11 @@ class VerificationResult:
     deactivated_tests: list[str] = field(default_factory=list)
     node_ids_all_passed: bool = True
     test_results: dict[str, str] = field(default_factory=dict)
+    # Batch 1: workspace integrity (Relay manifest comparison).
+    integrity_checked: bool = False
+    protected_violations: list[str] = field(default_factory=list)
+    ignored_artifacts: list[str] = field(default_factory=list)
+    excluded_from_test_run: list[str] = field(default_factory=list)
 
     def as_dict(self) -> dict:
         return {
@@ -53,6 +113,10 @@ class VerificationResult:
             "deleted_tests": self.deleted_tests,
             "deactivated_tests": self.deactivated_tests,
             "node_ids_all_passed": self.node_ids_all_passed,
+            "integrity_checked": self.integrity_checked,
+            "protected_violations": self.protected_violations,
+            "ignored_artifacts": self.ignored_artifacts,
+            "excluded_from_test_run": self.excluded_from_test_run,
         }
 
 
@@ -99,9 +163,42 @@ class Verifier:
         errors: list[str] = []
 
         branch = self._get_branch(workspace, errors)
-        status_lines = self._get_status_lines(workspace, errors)
-        changed, added, deleted = self._get_changed_files(workspace, errors)
-        unexpected = self._find_unexpected(added, expected_new_files or [])
+
+        # Batch 1: when Relay captured a baseline for this execution (always, on
+        # the production path), change detection comes from the Relay-owned
+        # integrity manifest, not from git.  The legacy git-status path remains
+        # only for executions that never had a baseline captured.
+        integrity_required = (
+            execution.baseline_manifest is not None
+            or execution.baseline_manifest_error is not None
+            or execution.baseline_test_exit is not None
+        )
+        integrity: IntegrityReport | None = None
+        if integrity_required:
+            integrity = self._check_integrity(execution, workspace, errors)
+            if integrity is None:
+                changed, added, deleted = [], [], []
+                status_lines: list[str] = []
+            else:
+                changed, added, deleted = integrity.changed, integrity.added, integrity.deleted
+                status_lines = (
+                    [f"M {f}" for f in changed]
+                    + [f"A {f}" for f in added]
+                    + [f"D {f}" for f in deleted]
+                )
+            expected = self._expected_new_files(task, expected_new_files, errors)
+            unexpected = [f for f in added if f not in expected]
+        else:
+            status_lines = self._get_status_lines(workspace, errors)
+            changed, added, deleted = self._get_changed_files(workspace, errors)
+            unexpected = self._find_unexpected(added, expected_new_files or [])
+
+        protected = list(integrity.protected_violations) if integrity else []
+        if protected:
+            errors.append(
+                "Protected tests or test configuration were altered by the worker: "
+                + "; ".join(protected)
+            )
 
         # P1-D: validate test specifiers before running (defence-in-depth).
         if task.required_tests:
@@ -119,16 +216,27 @@ class Verifier:
                     unexpected_files=unexpected,
                     test_exit_code=None,
                     test_output="",
-                    acceptance_results={},
+                    acceptance_results=self._check_acceptance(task, "", None),
                     report_agreement={},
                     errors=errors,
+                    integrity_checked=integrity is not None,
+                    protected_violations=protected,
                 )
 
-        # P1-J: run tests via shared utility so output is consistently captured.
-        test_exit, test_output, test_errors = run_test_suite(
-            workspace, task.required_tests, _worker_environment()
-        )
-        errors.extend(test_errors)
+        # Batch 1: if integrity could not be established, or protected files were
+        # altered, the outcome is already FAILED — do not execute worker-influenced
+        # test code at all.  Otherwise run the suite with worker-added modules
+        # excluded from collection.
+        excluded = list(integrity.new_python_files) if integrity else []
+        if integrity_required and (integrity is None or protected):
+            test_exit, test_output = None, ""
+        else:
+            # P1-J: run tests via shared utility so output is consistently captured.
+            test_exit, test_output, test_errors = run_test_suite(
+                workspace, task.required_tests, _worker_environment(),
+                ignore_paths=excluded,
+            )
+            errors.extend(test_errors)
 
         acceptance = self._check_acceptance(task, test_output, test_exit)
         report_agreement = self._compare_report(execution, changed, added, deleted, test_exit)
@@ -151,8 +259,10 @@ class Verifier:
         )
         errors.extend(accountability_errors)
 
-        # H-1..H-9: every condition must hold for TASK_COMPLETED.
+        # H-1..H-10: every condition must hold for verification to pass.
         # H-2 is conditional: only enforced when baseline collection was attempted.
+        # UNVERIFIED criteria do not fail verification; the CLI holds the task in
+        # ACCEPTANCE_REQUIRED until a human acknowledges them.
         passed = (
             test_exit == 0                                                          # H-1
             and (not baseline_was_attempted or bool(baseline))                      # H-2
@@ -161,8 +271,9 @@ class Verifier:
             and node_ids_all_passed                                                 # H-5
             and not no_op                                                           # H-6
             and not errors                                                          # H-7
-            and all(v for v in acceptance.values() if v is not None)               # H-8
+            and AC_FAIL not in acceptance.values()                                  # H-8
             and not unexpected                                                      # H-9
+            and not protected                                                       # H-10
         )
 
         return VerificationResult(
@@ -184,7 +295,50 @@ class Verifier:
             deactivated_tests=deactivated_tests,
             node_ids_all_passed=node_ids_all_passed,
             test_results=test_results,
+            integrity_checked=integrity is not None,
+            protected_violations=protected,
+            ignored_artifacts=list(integrity.ignored_artifacts) if integrity else [],
+            excluded_from_test_run=excluded,
         )
+
+    # ── Workspace integrity (Batch 1) ─────────────────────────────────────────
+
+    def _check_integrity(
+        self, execution: Execution, workspace: str, errors: list[str]
+    ) -> IntegrityReport | None:
+        """Compare the workspace with the Relay-captured baseline manifest.
+
+        Returns None (with an error appended) when no trustworthy baseline is
+        available; the caller treats that as a verification failure.
+        """
+        if execution.baseline_manifest_error:
+            errors.append(execution.baseline_manifest_error)
+            return None
+        if execution.baseline_manifest is None:
+            errors.append(
+                "No workspace integrity manifest was captured for this execution. "
+                "Changes cannot be verified. Fail closed."
+            )
+            return None
+        try:
+            baseline = WorkspaceSnapshot.from_json(execution.baseline_manifest)
+            current = snapshot_workspace(workspace)
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            errors.append(f"Workspace integrity check failed: {exc}. Fail closed.")
+            return None
+        return compare_snapshots(baseline, current, execution.baseline_tests_collected)
+
+    def _expected_new_files(
+        self, task: Task, override: list[str] | None, errors: list[str]
+    ) -> set[str]:
+        declared = override if override is not None else task.expected_new_files
+        expected: set[str] = set()
+        for path in declared:
+            try:
+                expected.add(normalize_relative_path(path))
+            except InvalidRelativePathError as exc:
+                errors.append(f"Invalid expected_new_files entry: {exc}")
+        return expected
 
     # ── Git inspection ────────────────────────────────────────────────────────
 
@@ -350,21 +504,20 @@ class Verifier:
 
     def _check_acceptance(
         self, task: Task, test_output: str, test_exit: int | None
-    ) -> dict[str, bool | None]:
-        results: dict[str, bool | None] = {}
-        lower_output = test_output.lower()
+    ) -> dict[str, str]:
+        """Return a PASS / FAIL / UNVERIFIED verdict for every acceptance criterion.
 
+        Every criterion appears in the result; none is ever omitted.  A
+        test-suite criterion is PASS only if the required tests actually ran and
+        exited 0 with output; if they did not run (or failed), it is FAIL.
+        """
+        results: dict[str, str] = {}
+        suite_passed = test_exit == 0 and bool(test_output)
         for criterion in task.acceptance_criteria:
-            lc = criterion.lower()
-            if any(kw in lc for kw in ("all tests pass", "no failing test", "tests pass")):
-                results[criterion] = (test_exit == 0 and bool(test_output))
-            elif "test" in lc and "pass" in lc:
-                results[criterion] = test_exit == 0
-            elif "test" in lc and ("fail" in lc or "error" in lc):
-                results[criterion] = test_exit != 0
+            if is_automatically_verifiable(criterion):
+                results[criterion] = AC_PASS if suite_passed else AC_FAIL
             else:
-                # Cannot deterministically verify — leave as None (unverified, not failed)
-                results[criterion] = None
+                results[criterion] = AC_UNVERIFIED
         return results
 
     # ── Report comparison ─────────────────────────────────────────────────────

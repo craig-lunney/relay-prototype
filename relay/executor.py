@@ -443,6 +443,7 @@ class ExecutionEngine:
         the verifier to fail closed on H-2 (must have collected at least one
         test before Claude ran).
         """
+        from .integrity import snapshot_workspace
         from .testing import collect_tests
         exit_code, collected, raw_output, _errors = collect_tests(
             workspace, task.required_tests, _worker_environment()
@@ -450,6 +451,22 @@ class ExecutionEngine:
         execution.baseline_tests_collected = collected
         execution.baseline_test_exit = exit_code
         execution.baseline_test_output = raw_output
+
+        # Batch 1: integrity manifest of the workspace as the worker will find it.
+        # Taken after collection (so nothing Relay does later is mistaken for a
+        # worker change) and before Claude is launched.  A capture failure is
+        # recorded, never ignored: the verifier fails closed on it.
+        try:
+            execution.baseline_manifest = snapshot_workspace(workspace).to_json()
+        except Exception as exc:  # any failure: record it; verification fails closed
+            execution.baseline_manifest = None
+            execution.baseline_manifest_error = (
+                f"Could not capture workspace integrity manifest: "
+                f"{type(exc).__name__}: {exc}"
+            )
+        # Persist the baseline before the worker starts, so the durable record
+        # reflects pre-worker state rather than whatever exists after it ran.
+        self._state.update_execution(execution)
 
     def cleanup_workspace(self, workspace: str, workspace_base: str | Path) -> None:
         """

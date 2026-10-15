@@ -7,9 +7,13 @@ in the worker environment.
 """
 from __future__ import annotations
 
+import contextlib
 import re
+import shutil
 import subprocess
+import tempfile
 from pathlib import Path
+from typing import Iterator
 
 # Strip ANSI colour/cursor escape sequences from pytest output.
 _ANSI = re.compile(r"\x1b\[[0-9;]*[mGKHFJABCDEFsu]")
@@ -30,6 +34,33 @@ _COLLECTED_RE = re.compile(r"^(.+::.+)$")
 
 def strip_ansi(s: str) -> str:
     return _ANSI.sub("", s)
+
+
+@contextlib.contextmanager
+def _pytest_command() -> Iterator[list[str]]:
+    """Yield the interpreter + pytest command prefix used for Relay's own runs.
+
+    Batch 1: the workspace's bytecode caches are worker-writable, and pytest
+    loads a cached (assertion-rewritten) pyc whenever its header matches the
+    source file's mtime and size — even with bytecode writing disabled.  A
+    planted pyc could therefore replace the code of an unchanged test file.
+    ``-X pycache_prefix`` points both the import system and pytest's rewrite
+    cache at an empty Relay-owned directory outside the workspace, so workspace
+    ``__pycache__`` content is never read; ``-B`` stops anything being written.
+    ``-p no:cacheprovider`` keeps ``.pytest_cache`` out of the run as well.
+
+    Flags are used rather than environment variables so the subprocess env
+    remains exactly the P1-G allowlist.  There is no bare ``pytest`` fallback:
+    a run that cannot carry these flags is not a trustworthy run.
+    """
+    cache_dir = tempfile.mkdtemp(prefix="relay-pycache-")
+    try:
+        yield [
+            "python", "-B", "-X", f"pycache_prefix={cache_dir}",
+            "-m", "pytest", "-p", "no:cacheprovider",
+        ]
+    finally:
+        shutil.rmtree(cache_dir, ignore_errors=True)
 
 
 def collect_tests(
@@ -54,11 +85,10 @@ def collect_tests(
     # regardless of any pytest config files in ancestor directories.
     args = ["--collect-only", "-q", f"--rootdir={workspace}", "--"] + required_tests
 
-    for prefix in (["python", "-m", "pytest"], ["pytest"]):
-        cmd = prefix + args
+    with _pytest_command() as prefix:
         try:
             proc = subprocess.Popen(
-                cmd,
+                prefix + args,
                 cwd=str(workspace),
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
@@ -66,21 +96,19 @@ def collect_tests(
                 text=True,
                 env=env,
             )
-            try:
-                out, err = proc.communicate(timeout=60)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                out, err = proc.communicate()
-                errors.append("Baseline collection timed out after 60s.")
-                return -1, [], (out or "") + (err or ""), errors
-            raw = (out or "") + (err or "")
-            ids = _parse_collection_output(raw)
-            return proc.returncode, ids, raw, errors
         except FileNotFoundError:
-            continue
-
-    errors.append("Neither 'python -m pytest' nor 'pytest' found during baseline collection.")
-    return None, [], "", errors
+            errors.append("'python' not found during baseline collection.")
+            return None, [], "", errors
+        try:
+            out, err = proc.communicate(timeout=60)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            out, err = proc.communicate()
+            errors.append("Baseline collection timed out after 60s.")
+            return -1, [], (out or "") + (err or ""), errors
+    raw = (out or "") + (err or "")
+    ids = _parse_collection_output(raw)
+    return proc.returncode, ids, raw, errors
 
 
 def run_test_suite(
@@ -88,9 +116,14 @@ def run_test_suite(
     required_tests: list[str],
     env: dict[str, str],
     timeout: int = 120,
+    ignore_paths: list[str] | None = None,
 ) -> tuple[int | None, str, list[str]]:
     """
     Run ``pytest -v --tb=short`` on *required_tests*.
+
+    *ignore_paths* (workspace-relative) are passed as ``--ignore`` so that
+    worker-added modules are never collected — and therefore never imported —
+    by the verification run.  They can still be imported by application code.
 
     Uses subprocess.run so that existing verifier tests can mock it via
     ``patch("subprocess.run", ...)``.
@@ -103,28 +136,26 @@ def run_test_suite(
     errors: list[str] = []
     # Pin rootdir to the workspace so node IDs are always workspace-relative,
     # matching the format produced by collect_tests().
-    args = ["-v", "--tb=short", f"--rootdir={workspace}", "--"] + required_tests
+    ignores = [f"--ignore={Path(workspace) / p}" for p in (ignore_paths or [])]
+    args = ["-v", "--tb=short", f"--rootdir={workspace}", *ignores, "--"] + required_tests
 
-    for prefix in (["python", "-m", "pytest"], ["pytest"]):
-        cmd = prefix + args
+    with _pytest_command() as prefix:
         try:
             result = subprocess.run(
-                cmd,
+                prefix + args,
                 cwd=str(workspace),
                 capture_output=True,
                 text=True,
                 timeout=timeout,
                 env=env,
             )
-            return result.returncode, result.stdout + result.stderr, errors
         except FileNotFoundError:
-            continue
+            errors.append("'python' not found; the test suite could not be run.")
+            return None, "", errors
         except subprocess.TimeoutExpired:
             errors.append(f"Test run timed out after {timeout}s.")
             return -1, "TIMEOUT", errors
-
-    errors.append("Neither 'python -m pytest' nor 'pytest' found.")
-    return None, "", errors
+    return result.returncode, result.stdout + result.stderr, errors
 
 
 def _parse_collection_output(raw: str) -> list[str]:
