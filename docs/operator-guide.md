@@ -92,7 +92,10 @@ The outcome is printed on the last line:
 relay status TASK-XXXXXXXX        # status, attempts, every execution, criteria awaiting you
 relay audit TASK-XXXXXXXX         # the full append-only event trail
 relay audit                       # all events
+relay audit --verify              # check the audit log's hash chain; prints the head hash
 ```
+
+`relay audit --verify` exits 1 and lists the problems if any event was edited, deleted or re-ordered, or inserted mid-log. Note the head hash it prints, for example at each A2A gate: a log that was later rebuilt or cut short would no longer match it.
 
 The full verification record is the `VERIFICATION_COMPLETED` event. It includes:
 

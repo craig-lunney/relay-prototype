@@ -56,8 +56,19 @@ claim is recorded permanently with its evidence.
   changed outside the ledger, inserted rows that break a rule, and tasks with
   no history. A forged row that obeys every rule cannot be told apart from a
   real one.
-- Relay's `events` table is append-only by convention; it has no hash chain or
-  triggers yet.
+- Relay's audit events are hash-chained (Batch 6): each event stores the
+  previous event's hash and its own content hash. `relay audit --verify`
+  detects edited, deleted or re-ordered events, events inserted mid-log, and
+  unhashed rows. It cannot detect a chain rebuilt from scratch, a correctly
+  hashed event appended at the end, or events cut from the end, unless you
+  recorded the head hash it prints somewhere independent (for example as
+  evidence in the A2A ledger). Events written before the upgrade are chained
+  once, on the first open after upgrading (do this with no relay process
+  running); their earlier history cannot be vouched for, and downgrading to a
+  pre-chain version of Relay is not supported. Someone with file access could
+  reset the database's schema version and wipe every hash to force a re-chain;
+  the version gate only raises the bar. The externally recorded head hash is
+  the real control.
 - Anyone with file access can drop triggers or rewrite either SQLite file.
   These measures catch accidents and casual edits, not a determined local
   attacker.
@@ -148,5 +159,5 @@ is the human's attestation.
 ## Deferred beyond v1
 
 GitHub API integration · OS-level sandboxing · operator authentication ·
-audit hash-chain for Relay events · test-maintenance task type · deployment,
+test-maintenance task type · deployment,
 publishing, merging (out of scope by design) · autonomous approval (prohibited).

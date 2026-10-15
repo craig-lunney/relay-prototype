@@ -102,6 +102,18 @@ and retry, crash recovery, T2 and T3 protocol walk-throughs). It writes a
 transcript; the committed one is in
 [docs/acceptance/acceptance-transcript.md](docs/acceptance/acceptance-transcript.md).
 
+## One real Claude run
+
+```bash
+python demo/real_run.py                 # uses ~/.relay_api_key.txt; small API cost
+```
+
+Runs `sample_task.json` with the real Claude Code CLI against a throwaway copy
+of `test-repository/` and writes a Markdown report (status, Relay's
+verification, the worker's diff, the commands and their output). A successful
+run ends in `ACCEPTANCE_REQUIRED`: the sample's numeric criteria are yours to
+check and acknowledge.
+
 ## Operating it
 
 Step-by-step instructions for a real run — preparing a task, approval,

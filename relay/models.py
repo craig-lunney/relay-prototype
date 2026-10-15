@@ -62,6 +62,7 @@ class AuditEventType(str, Enum):
     ACCEPTANCE_REQUIRED = "ACCEPTANCE_REQUIRED"
     ACCEPTANCE_ACKNOWLEDGED = "ACCEPTANCE_ACKNOWLEDGED"
     ACCEPTANCE_REJECTED = "ACCEPTANCE_REJECTED"
+    AUDIT_CHAIN_STARTED = "AUDIT_CHAIN_STARTED"
 
 
 # Relay owns all state transitions. Agents cannot declare their own status.

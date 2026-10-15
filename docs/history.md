@@ -48,4 +48,5 @@ the work was done in batches, each independently reviewed before commit:
 | 2 — Packaging and schema (`eb50ee1`) | Working editable install; `python -m relay/a2a`; one task-schema contract; friendly task-file errors |
 | 3 — Execution robustness (`1dacee6`) | Orphaned-task recovery; lease before destructive workspace prep; ownership-safe pre-launch failure handling; lease renewal through verification; base_ref and required_tests validation |
 | 4 — A2A attested ledger (`2a591b8`) | Actor/role/evidence on every step; append-only history; Relay evidence link (D1/D2); T3 human re-run (D4); tier escalation; `a2a check` |
-| 5 — Documentation and acceptance | README, operator guide, limitations, development guide; scripted end-to-end acceptance demonstration |
+| 5 — Documentation and acceptance (`8c36ed1`) | README, operator guide, limitations, development guide; scripted end-to-end acceptance demonstration |
+| 6 — Audit hash chain | Tamper-evident Relay audit log; `relay audit --verify` |

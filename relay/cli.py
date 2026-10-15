@@ -461,6 +461,19 @@ def cmd_status(args) -> None:
 
 def cmd_audit(args) -> None:
     state, _, _ = _make_components(args.db)
+    if getattr(args, "verify", False):
+        problems, count, head = state.verify_audit_chain()
+        if problems:
+            print(f"Audit chain BROKEN ({len(problems)} problem(s) in {count} events):",
+                  file=sys.stderr)
+            for problem in problems:
+                print(f"  - {problem}", file=sys.stderr)
+            sys.exit(1)
+        print(f"Audit chain intact: {count} events.")
+        print(f"Head hash: {head}")
+        print("Record the head hash somewhere independent to detect a rebuilt or "
+              "truncated log later.")
+        return
     events = (
         state.get_events_for_task(args.task_id)
         if args.task_id
@@ -659,8 +672,10 @@ def main() -> None:
     p.add_argument("task_id")
     p.set_defaults(func=cmd_status)
 
-    p = sub.add_parser("audit", help="Show audit log")
+    p = sub.add_parser("audit", help="Show audit log, or verify its hash chain")
     p.add_argument("task_id", nargs="?", help="Filter by task_id (omit for all events)")
+    p.add_argument("--verify", action="store_true", default=False,
+                   help="Verify the audit hash chain and print its head hash")
     p.set_defaults(func=cmd_audit)
 
     p = sub.add_parser("recover", help="Scan for interrupted executions")

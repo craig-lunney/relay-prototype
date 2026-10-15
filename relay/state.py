@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 import threading
@@ -32,6 +33,58 @@ def _parse_dt(s: str | None) -> datetime | None:
 
 class InvalidTransitionError(Exception):
     pass
+
+
+
+# ── Audit hash chain (Batch 6) ────────────────────────────────────────────────
+# Every event stores the hash of the previous event and its own hash over its
+# full content, so editing, deleting or re-ordering any committed event is
+# detectable by StateManager.verify_audit_chain().  This is tamper EVIDENCE,
+# not prevention: someone with write access to the file can rebuild the whole
+# chain.  Record the head hash (`relay audit --verify`) somewhere independent,
+# e.g. as evidence in the A2A ledger, to anchor it.
+GENESIS_HASH = "0" * 64
+
+
+def event_hash(prev_hash: str, sequence: int, event_id: str, event_type: str,
+               task_id: str, execution_id: str | None, timestamp: str,
+               actor: str, details: str) -> str:
+    payload = json.dumps(
+        [prev_hash, sequence, event_id, event_type, task_id, execution_id,
+         timestamp, actor, details],
+        separators=(",", ":"), ensure_ascii=False,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _insert_chained_event(conn: sqlite3.Connection, event_id: str, event_type: str,
+                          task_id: str, execution_id: str | None, timestamp: str,
+                          actor: str, details: str) -> int:
+    """Insert one audit event linked to the current chain head.
+
+    Must run inside the caller's transaction (it does not commit).  Sequence
+    and previous hash are read from the same head row, so a concurrent writer
+    that commits first makes this INSERT fail the UNIQUE(sequence) check
+    instead of forking the chain.
+    """
+    head = conn.execute(
+        "SELECT sequence, hash FROM events ORDER BY sequence DESC LIMIT 1"
+    ).fetchone()
+    seq = (head[0] if head else 0) + 1
+    prev = (head[1] if head and head[1] else GENESIS_HASH)
+    digest = event_hash(prev, seq, event_id, event_type, task_id, execution_id,
+                        timestamp, actor, details)
+    conn.execute(
+        """
+        INSERT INTO events
+            (event_id, sequence, event_type, task_id, execution_id,
+             timestamp, actor, details, prev_hash, hash)
+        VALUES (?,?,?,?,?,?,?,?,?,?)
+        """,
+        (event_id, seq, event_type, task_id, execution_id, timestamp, actor,
+         details, prev, digest),
+    )
+    return seq
 
 
 class StateManager:
@@ -159,12 +212,16 @@ class StateManager:
             "ALTER TABLE tasks ADD COLUMN expected_new_files TEXT NOT NULL DEFAULT '[]'",
             "ALTER TABLE executions ADD COLUMN baseline_manifest TEXT",
             "ALTER TABLE executions ADD COLUMN baseline_manifest_error TEXT",
+            # Batch 6: audit hash chain.
+            "ALTER TABLE events ADD COLUMN prev_hash TEXT",
+            "ALTER TABLE events ADD COLUMN hash TEXT",
         ):
             try:
                 conn.execute(stmt)
             except sqlite3.OperationalError:
                 pass  # column already exists
         conn.commit()
+        self._chain_legacy_events(conn)
 
     # ── Tasks ─────────────────────────────────────────────────────────────────
 
@@ -602,24 +659,11 @@ class StateManager:
         _MAX_RETRIES = 10
         for attempt in range(_MAX_RETRIES):
             try:
-                seq = (
-                    conn.execute(
-                        "SELECT COALESCE(MAX(sequence),0) FROM events"
-                    ).fetchone()[0]
-                ) + 1
-                conn.execute(
-                    """
-                    INSERT INTO events
-                        (event_id, sequence, event_type, task_id, execution_id,
-                         timestamp, actor, details)
-                    VALUES (?,?,?,?,?,?,?,?)
-                    """,
-                    (
-                        event.event_id, seq, event.event_type.value,
-                        event.task_id, event.execution_id,
-                        event.timestamp.isoformat(), event.actor,
-                        json.dumps(event.details),
-                    ),
+                _insert_chained_event(
+                    conn, event.event_id, event.event_type.value,
+                    event.task_id, event.execution_id,
+                    event.timestamp.isoformat(), event.actor,
+                    json.dumps(event.details),
                 )
                 conn.commit()
                 return
@@ -635,6 +679,108 @@ class StateManager:
             f"{event.event_id!r} after {_MAX_RETRIES} attempts. "
             "Concurrent sequence collisions not resolved."
         )
+
+    # PRAGMA user_version for the Relay database.  0: before the audit hash
+    # chain; 1: chained (Batch 6).
+    _AUDIT_CHAIN_VERSION = 1
+
+    def _chain_legacy_events(self, conn: sqlite3.Connection) -> None:
+        """ONE-TIME migration: hash events written before the chain existed.
+
+        Gated by PRAGMA user_version, so it runs at most once per database: on
+        the first open after upgrading (or creating) it.  Afterwards unhashed
+        rows are only ever REPORTED by verify_audit_chain, never repaired, so
+        wiping hashes and reopening cannot launder a tampered log (unless the
+        user_version is reset too; only an externally recorded head hash
+        detects that).  The common
+        path (already migrated) takes no write lock and scans nothing, so
+        read-only commands keep working while another process writes.
+
+        Upgrade with no relay process running: an old-version writer appending
+        unhashed rows after the migration would show up as a broken chain.
+        """
+        if conn.execute("PRAGMA user_version").fetchone()[0] >= self._AUDIT_CHAIN_VERSION:
+            return
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            if conn.execute("PRAGMA user_version").fetchone()[0] < self._AUDIT_CHAIN_VERSION:
+                legacy = 0
+                prev = GENESIS_HASH
+                rows = conn.execute("SELECT * FROM events ORDER BY sequence")
+                pending = []
+                for r in rows:
+                    if r["hash"]:
+                        break
+                    pending.append(r)
+                for r in pending:
+                    digest = event_hash(prev, r["sequence"], r["event_id"], r["event_type"],
+                                        r["task_id"], r["execution_id"], r["timestamp"],
+                                        r["actor"], r["details"])
+                    conn.execute(
+                        "UPDATE events SET prev_hash=?, hash=? WHERE sequence=?",
+                        (prev, digest, r["sequence"]),
+                    )
+                    prev = digest
+                    legacy += 1
+                if legacy:
+                    _insert_chained_event(
+                        conn, AuditEvent.new_id(), AuditEventType.AUDIT_CHAIN_STARTED.value,
+                        "-", None, _now_iso(), "relay",
+                        json.dumps({"legacy_events_chained": legacy}),
+                    )
+                conn.execute(f"PRAGMA user_version = {self._AUDIT_CHAIN_VERSION}")
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
+
+    def verify_audit_chain(self) -> tuple[list[str], int, str]:
+        """Re-compute the audit hash chain.
+
+        Returns (problems, event_count, head_hash).  Detects edited, deleted or
+        re-ordered events, events inserted mid-log, unhashed rows, sequence
+        gaps, and a misplaced or repeated AUDIT_CHAIN_STARTED marker.  Cannot
+        detect a chain rebuilt from scratch, a correctly hashed event appended
+        at the end, or events cut from the end, unless the head hash was
+        recorded elsewhere beforehand.
+        """
+        problems: list[str] = []
+        prev = GENESIS_HASH
+        expected_seq = 1
+        count = 0
+        head = GENESIS_HASH
+        markers = 0
+        for r in self._conn().execute("SELECT * FROM events ORDER BY sequence"):
+            count += 1
+            seq = r["sequence"]
+            if seq != expected_seq:
+                problems.append(f"sequence gap: expected #{expected_seq}, found #{seq}")
+                expected_seq = seq
+            if not r["hash"]:
+                problems.append(f"#{seq}: event has no hash (written outside Relay?)")
+            else:
+                if r["prev_hash"] != prev:
+                    problems.append(f"#{seq}: link to the previous event is broken")
+                recomputed = event_hash(r["prev_hash"] or "", seq, r["event_id"],
+                                        r["event_type"], r["task_id"], r["execution_id"],
+                                        r["timestamp"], r["actor"], r["details"])
+                if recomputed != r["hash"]:
+                    problems.append(f"#{seq}: content does not match its hash (edited)")
+            if r["event_type"] == AuditEventType.AUDIT_CHAIN_STARTED.value:
+                markers += 1
+                try:
+                    chained = json.loads(r["details"]).get("legacy_events_chained")
+                except (ValueError, AttributeError):
+                    chained = None
+                if markers > 1:
+                    problems.append(f"#{seq}: a second AUDIT_CHAIN_STARTED marker")
+                elif chained != count - 1:  # rows before the marker
+                    problems.append(f"#{seq}: AUDIT_CHAIN_STARTED is not directly after "
+                                    "the legacy events it claims to cover")
+            prev = r["hash"] or ""
+            head = r["hash"] or GENESIS_HASH
+            expected_seq += 1
+        return problems, count, head
 
     def get_events_for_task(self, task_id: str) -> list[AuditEvent]:
         rows = self._conn().execute(
@@ -713,22 +859,10 @@ class StateManager:
                     f"Concurrent modification: task {task_id!r} status changed "
                     "during RECOVERY_REQUIRED → READY transition."
                 )
-            seq = conn.execute(
-                "SELECT COALESCE(MAX(sequence), 0) FROM events"
-            ).fetchone()[0] + 1
-            conn.execute(
-                """
-                INSERT INTO events
-                    (event_id, sequence, event_type, task_id, execution_id,
-                     timestamp, actor, details)
-                VALUES (?,?,?,?,?,?,?,?)
-                """,
-                (
-                    AuditEvent.new_id(), seq,
-                    AuditEventType.RECOVERY_ACCEPTED.value,
-                    task_id, None, now, actor,
-                    json.dumps({"previous_status": current.value}),
-                ),
+            _insert_chained_event(
+                conn, AuditEvent.new_id(), AuditEventType.RECOVERY_ACCEPTED.value,
+                task_id, None, now, actor,
+                json.dumps({"previous_status": current.value}),
             )
 
     def retry_task_atomic(
@@ -778,22 +912,10 @@ class StateManager:
                     f"Concurrent modification: task {task_id!r} status changed "
                     "during TIMEOUT → READY transition."
                 )
-            seq = conn.execute(
-                "SELECT COALESCE(MAX(sequence), 0) FROM events"
-            ).fetchone()[0] + 1
-            conn.execute(
-                """
-                INSERT INTO events
-                    (event_id, sequence, event_type, task_id, execution_id,
-                     timestamp, actor, details)
-                VALUES (?,?,?,?,?,?,?,?)
-                """,
-                (
-                    AuditEvent.new_id(), seq,
-                    AuditEventType.TASK_RETRIED.value,
-                    task_id, None, now, actor,
-                    json.dumps({"attempt_count": attempt_count}),
-                ),
+            _insert_chained_event(
+                conn, AuditEvent.new_id(), AuditEventType.TASK_RETRIED.value,
+                task_id, None, now, actor,
+                json.dumps({"attempt_count": attempt_count}),
             )
 
     def acknowledge_acceptance_atomic(
@@ -848,26 +970,15 @@ class StateManager:
                     f"Concurrent modification: task {task_id!r} status changed "
                     f"during ACCEPTANCE_REQUIRED → {new_status.value} transition."
                 )
-            seq = conn.execute(
-                "SELECT COALESCE(MAX(sequence), 0) FROM events"
-            ).fetchone()[0] + 1
-            conn.execute(
-                """
-                INSERT INTO events
-                    (event_id, sequence, event_type, task_id, execution_id,
-                     timestamp, actor, details)
-                VALUES (?,?,?,?,?,?,?,?)
-                """,
-                (
-                    AuditEvent.new_id(), seq, event_type.value,
-                    task_id, None, now, actor,
-                    json.dumps({
+            _insert_chained_event(
+                conn, AuditEvent.new_id(), event_type.value,
+                task_id, None, now, actor,
+                json.dumps({
                         "criteria": criteria,
                         "decision": "ACCEPTED" if accept else "REJECTED",
                         "reason": reason,
                         "human_acknowledgement": True,
                     }),
-                ),
             )
 
     def mark_stale_lease_atomic(
@@ -957,25 +1068,13 @@ class StateManager:
                     )
                     task_transitioned = cursor.rowcount > 0
 
-            seq = conn.execute(
-                "SELECT COALESCE(MAX(sequence), 0) FROM events"
-            ).fetchone()[0] + 1
-            conn.execute(
-                """
-                INSERT INTO events
-                    (event_id, sequence, event_type, task_id, execution_id,
-                     timestamp, actor, details)
-                VALUES (?,?,?,?,?,?,?,?)
-                """,
-                (
-                    AuditEvent.new_id(), seq,
-                    AuditEventType.RECOVERY_SCAN_STALE_LEASE.value,
-                    task_id, execution_id, now, actor,
-                    json.dumps({
+            _insert_chained_event(
+                conn, AuditEvent.new_id(), AuditEventType.RECOVERY_SCAN_STALE_LEASE.value,
+                task_id, execution_id, now, actor,
+                json.dumps({
                         "execution_id": execution_id,
                         "task_transitioned": task_transitioned,
                     }),
-                ),
             )
         return True
 
@@ -1032,22 +1131,10 @@ class StateManager:
                 "ORDER BY attempt_number DESC, started_at DESC LIMIT 1",
                 (task_id,),
             ).fetchone()
-            seq = conn.execute(
-                "SELECT COALESCE(MAX(sequence), 0) FROM events"
-            ).fetchone()[0] + 1
-            conn.execute(
-                """
-                INSERT INTO events
-                    (event_id, sequence, event_type, task_id, execution_id,
-                     timestamp, actor, details)
-                VALUES (?,?,?,?,?,?,?,?)
-                """,
-                (
-                    AuditEvent.new_id(), seq,
-                    AuditEventType.RECOVERY_REQUIRED.value,
-                    task_id, latest["execution_id"] if latest else None, now, actor,
-                    json.dumps({"previous_status": current.value, "reason": reason}),
-                ),
+            _insert_chained_event(
+                conn, AuditEvent.new_id(), AuditEventType.RECOVERY_REQUIRED.value,
+                task_id, latest["execution_id"] if latest else None, now, actor,
+                json.dumps({"previous_status": current.value, "reason": reason}),
             )
             return True
 
@@ -1083,20 +1170,8 @@ class StateManager:
                 "WHERE execution_id=?",
                 (ExecutionStatus.FAILED.value, now, error, execution_id),
             )
-            seq = conn.execute(
-                "SELECT COALESCE(MAX(sequence), 0) FROM events"
-            ).fetchone()[0] + 1
-            conn.execute(
-                """
-                INSERT INTO events
-                    (event_id, sequence, event_type, task_id, execution_id,
-                     timestamp, actor, details)
-                VALUES (?,?,?,?,?,?,?,?)
-                """,
-                (
-                    AuditEvent.new_id(), seq,
-                    AuditEventType.EXECUTION_FAILED.value,
-                    task_id, execution_id, now, actor,
-                    json.dumps({"error": error}),
-                ),
+            _insert_chained_event(
+                conn, AuditEvent.new_id(), AuditEventType.EXECUTION_FAILED.value,
+                task_id, execution_id, now, actor,
+                json.dumps({"error": error}),
             )
