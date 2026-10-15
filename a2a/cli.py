@@ -80,7 +80,7 @@ def cmd_advance(args) -> None:
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="a2a",
-        description="A2A Engineering Collaboration Protocol — task CLI",
+        description="A2A Engineering Collaboration Protocol - task CLI",
     )
     parser.add_argument(
         "--db",
@@ -140,3 +140,7 @@ def main() -> None:
     parser = _build_parser()
     args = parser.parse_args()
     args.func(args)
+
+
+if __name__ == "__main__":
+    main()

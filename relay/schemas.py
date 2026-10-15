@@ -29,9 +29,10 @@ _TASK_INPUT_SCHEMA: dict[str, Any] = {
     "additional_properties": False,
     "required": ["project_id", "repository", "objective"],
     "properties": {
-        "project_id":          {"type": str},
-        "repository":          {"type": str},
-        "objective":           {"type": str},
+        "protocol_version":    {"type": str, "enum": frozenset({"0.1"})},
+        "project_id":          {"type": str, "min_length": 1},
+        "repository":          {"type": str, "min_length": 1},
+        "objective":           {"type": str, "min_length": 1},
         "base_ref":            {"type": str},
         "working_ref":         {"type": str},
         "requirements":        {"type": list, "items": str},
@@ -110,6 +111,11 @@ def _validate(data: Any, schema: dict[str, Any]) -> None:
                         f"{name}: field {field!r}[{i}] must be "
                         f"{item_type.__name__}, got {type(item).__name__}"
                     )
+        if "min_length" in spec and len(value) < spec["min_length"]:
+            raise ValidationError(
+                f"{name}: field {field!r} must have at least "
+                f"{spec['min_length']} character(s)"
+            )
         if "enum" in spec and value not in spec["enum"]:
             raise ValidationError(
                 f"{name}: field {field!r} value {value!r} is not one of "
@@ -121,7 +127,7 @@ def _validate(data: Any, schema: dict[str, Any]) -> None:
         extra = set(data) - known
         if extra:
             raise ValidationError(
-                f"{name}: unexpected field(s) {sorted(extra)} — "
+                f"{name}: unexpected field(s) {sorted(extra)} - "
                 "task input must not contain unrecognised fields"
             )
 

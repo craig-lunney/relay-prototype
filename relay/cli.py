@@ -27,9 +27,24 @@ def _make_components(db_path: str):
 # ── Commands ──────────────────────────────────────────────────────────────────
 
 def cmd_create_task(args) -> None:
-    state, policy, audit = _make_components(args.db)
+    # Read and parse before touching the database, so a bad file changes nothing.
+    # utf-8-sig accepts the BOM that Windows editors and PowerShell often add.
+    try:
+        task_def = json.loads(Path(args.task_file).read_text(encoding="utf-8-sig"))
+    except OSError as exc:
+        print(f"Cannot read task file {args.task_file!r}: {exc}. No task was created.",
+              file=sys.stderr)
+        sys.exit(1)
+    except UnicodeDecodeError as exc:
+        print(f"Task file {args.task_file!r} is not UTF-8 encoded ({exc.reason}). "
+              "Save it as UTF-8. No task was created.", file=sys.stderr)
+        sys.exit(1)
+    except json.JSONDecodeError as exc:
+        print(f"Task file {args.task_file!r} is not valid JSON: {exc}. No task was created.",
+              file=sys.stderr)
+        sys.exit(1)
 
-    task_def = json.loads(Path(args.task_file).read_text(encoding="utf-8"))
+    state, policy, audit = _make_components(args.db)
 
     # P1-E: validate task definition structure before any state is created.
     # Rejects missing fields, wrong types, and unexpected fields (e.g. "approved":true).
@@ -54,6 +69,7 @@ def cmd_create_task(args) -> None:
         expected_deleted_tests=task_def.get("expected_deleted_tests", []),
         expected_new_files=task_def.get("expected_new_files", []),
         approval_policy=task_def.get("approval_policy", "auto"),
+        protocol_version=task_def.get("protocol_version", "0.1"),
         status=TaskStatus.CREATED,
     )
 
@@ -178,7 +194,7 @@ def cmd_run_task(args) -> None:
                 # state is recorded in the DB and audit log.
                 if not keep_workspace and execution.workspace:
                     engine.cleanup_workspace(execution.workspace, workspace_base)
-                print(f"Task {task.task_id}: FAILED — {reason}", file=sys.stderr)
+                print(f"Task {task.task_id}: FAILED - {reason}", file=sys.stderr)
                 sys.exit(1)
 
         elif execution.status.value == "FAILED":
@@ -194,7 +210,7 @@ def cmd_run_task(args) -> None:
             audit.task_failed(task.task_id, reason)
             if not keep_workspace and execution.workspace:
                 engine.cleanup_workspace(execution.workspace, workspace_base)
-            print(f"Task {task.task_id}: FAILED — {reason}", file=sys.stderr)
+            print(f"Task {task.task_id}: FAILED - {reason}", file=sys.stderr)
             sys.exit(1)
 
         elif execution.status.value == "TIMEOUT":
@@ -509,7 +525,7 @@ def cmd_retry_task(args) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="relay",
-        description="Project Relay — safe AI-to-AI engineering collaboration prototype",
+        description="Project Relay - safe AI-to-AI engineering collaboration prototype",
     )
     parser.add_argument("--db", default="relay.db", help="SQLite database path")
     sub = parser.add_subparsers(dest="command")

@@ -2,21 +2,22 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "relay:task:0.1",
   "title": "Relay Task Definition",
-  "description": "Machine-readable task definition for Project Relay Prototype 0.",
+  "description": "Task definition accepted by `relay create-task`. Kept in step with the runtime validator in relay/schemas.py (tests/test_packaging_schema.py fails if they diverge).",
   "type": "object",
   "required": [
-    "protocol_version",
     "project_id",
     "repository",
-    "objective",
-    "requested_actions"
+    "objective"
   ],
   "additionalProperties": false,
   "properties": {
     "protocol_version": {
       "type": "string",
-      "const": "0.1",
-      "description": "Must match the Relay protocol version."
+      "enum": [
+        "0.1"
+      ],
+      "default": "0.1",
+      "description": "Relay task protocol version. Optional; defaults to 0.1."
     },
     "project_id": {
       "type": "string",
@@ -35,52 +36,77 @@
     "working_ref": {
       "type": "string",
       "default": "main",
-      "description": "The ref Claude will work on inside the workspace copy."
+      "description": "Recorded for reference only; Relay checks out base_ref in the workspace."
     },
     "objective": {
       "type": "string",
-      "minLength": 10,
+      "minLength": 1,
       "description": "Plain-language description of what should be achieved."
     },
     "requirements": {
       "type": "array",
-      "items": { "type": "string" },
+      "items": {
+        "type": "string"
+      },
       "description": "Specific requirements the implementation must satisfy."
     },
     "acceptance_criteria": {
       "type": "array",
-      "items": { "type": "string" },
+      "items": {
+        "type": "string"
+      },
       "description": "Criteria reported as PASS, FAIL or UNVERIFIED. Only recognised test-suite criteria are checked automatically; any other criterion is UNVERIFIED and requires explicit human acknowledgement before COMPLETED."
     },
     "requested_actions": {
       "type": "array",
       "items": {
         "type": "string",
-        "enum": ["read_repository", "modify_working_tree", "run_tests"]
+        "enum": [
+          "read_repository",
+          "modify_working_tree",
+          "run_tests"
+        ]
       },
       "description": "Capabilities this task requests. Relay policy is the authority — tasks cannot grant themselves additional capabilities."
     },
     "forbidden_actions": {
       "type": "array",
-      "items": { "type": "string" },
+      "items": {
+        "type": "string"
+      },
       "description": "Actions the task itself explicitly forbids (in addition to Relay's global policy)."
     },
     "required_tests": {
       "type": "array",
-      "items": { "type": "string" },
+      "items": {
+        "type": "string"
+      },
       "description": "Test files or patterns that Relay's verifier must run independently."
+    },
+    "expected_deleted_tests": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "default": [],
+      "description": "Baseline test node IDs the task is authorised to delete. Only honoured for tests actually collected in Relay's baseline."
     },
     "expected_new_files": {
       "type": "array",
-      "items": { "type": "string" },
+      "items": {
+        "type": "string"
+      },
       "default": [],
       "description": "Workspace-relative paths the worker is expected to create. Any other new file fails verification. Cannot authorise protected additions (conftest.py, pytest configuration, start-up hooks)."
     },
     "approval_policy": {
       "type": "string",
-      "enum": ["auto", "human_required"],
+      "enum": [
+        "auto",
+        "manual"
+      ],
       "default": "auto",
-      "description": "auto = Relay decides; human_required = privileged action needs human sign-off."
+      "description": "auto = READY after policy validation; manual = BLOCKED until `relay approve-task`."
     }
   }
 }
