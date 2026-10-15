@@ -142,6 +142,9 @@ BEHAVIOURS = {
     ),
     "pth_inject": lambda: (fix(), _write(Path("relay_evil.pth"), "import os\n")),
     "poison_pyc": poison_pyc,
+    # Never finishes within a short timeout (used for timeout / crash-recovery demos).
+    # 12 s: demo/acceptance_demo.py HANG_SECONDS must match.
+    "hang": lambda: __import__("time").sleep(12),
     # Bug left unfixed; a new test module patches the application at import time.
     "monkeypatch_via_new_test": lambda: _write(Path("test_aaa_patch.py"), _IMPORT_TIME_PATCH),
 }

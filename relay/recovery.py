@@ -6,6 +6,7 @@ import sys
 from datetime import datetime, timezone
 
 from .audit import AuditLog
+from .executor import _windows_tool
 from .models import ExecutionStatus, TaskStatus
 from .state import StateManager
 
@@ -167,7 +168,7 @@ class RecoveryEngine:
         import subprocess as sp
         try:
             result = sp.run(
-                ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
+                [_windows_tool("tasklist.exe"), "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
                 capture_output=True, text=True, timeout=5,
             )
             return f'"{pid}"' in result.stdout

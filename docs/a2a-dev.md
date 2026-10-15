@@ -160,7 +160,10 @@ The creation row records the task's tier, and `check` replays the tier from it.
 - a task with no history;
 - rows that cannot be parsed.
 
-This catches raw-SQL edits and rows forged by insertion.
+This catches raw-SQL edits and inserted rows that break a rule. A forged row
+that obeys every rule (right role, evidence present, valid step) is
+indistinguishable from a real one: the ledger records attestations, it does not
+authenticate them.
 
 ---
 
@@ -217,6 +220,6 @@ They are linked by reference only. An implementation step in A2A cites a Relay t
 | `tests/test_a2a_state.py` | Persistence, CAS, graph and tier enforcement at the state layer |
 | `tests/test_a2a_service.py` | Service API, domain errors, tier paths |
 | `tests/test_a2a_cli.py` | CLI commands and exit codes |
-| `tests/test_a2a_ledger.py` | Batch 4 and its review findings: role authority, canonical actor binding, evidence and reasons, append-only tables, tier escalation, legacy import, `check` replay (including forged rows), the Relay evidence link against a real read-only Relay DB (missing/unreadable/re-cited), T3 re-run windows, and the CLI end to end |
+| `tests/test_a2a_ledger.py` | Batch 4 and its review findings: role authority, canonical actor binding, evidence and reasons, append-only tables, tier escalation, legacy import, `check` replay (including rule-breaking forged rows), the Relay evidence link against a real read-only Relay DB (missing/unreadable/re-cited), T3 re-run windows, and the CLI end to end |
 
 Most of the older tests walk the protocol through `tests/a2a_support.py`. For each step, it attests the role the protocol prescribes, cites evidence, cites a Relay task where one is required, and records the T3 re-run. Tests that exercise authority or evidence build their own `A2AAttestation` instead.

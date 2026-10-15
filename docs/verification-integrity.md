@@ -2,8 +2,8 @@
 
 This document describes how Relay's verifier establishes what a worker changed,
 which changes are forbidden, how acceptance criteria are reported, and which
-risks remain. It covers behaviour introduced in Batch 1; the README rewrite is
-deferred to the documentation batch.
+risks remain. It covers behaviour introduced in Batch 1; the overall picture is
+in the README and docs/limitations.md.
 
 ## Why
 

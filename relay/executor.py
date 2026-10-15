@@ -199,6 +199,64 @@ def _build_auth_settings() -> tuple[list[str], None] | tuple[None, str]:
     return ["--settings", _json.dumps({"apiKeyHelper": helper_cmd})], None
 
 
+def _assert_git_root(workspace: str) -> None:
+    """Refuse to run git unless the workspace copy is itself a git repository root.
+
+    Batch 5 review (B1): git searches parent directories for a repository.  If
+    the task's repository was not a git root (no .git directory at its top, or
+    a worktree whose .git is a file pointing elsewhere), `git checkout` in the
+    copy would act on whichever repository encloses the workspace — by default
+    Relay's own checkout.  Fail closed instead.
+    """
+    ws = Path(workspace).resolve()
+    if not (ws / ".git").is_dir():
+        raise RuntimeError(
+            "Task repository is not the root of a git repository (no .git directory "
+            "at its top level). Relay will not run git in a copy of it: git would act "
+            "on an enclosing repository instead."
+        )
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"], cwd=str(ws),
+            capture_output=True, text=True, timeout=30, env=_worker_environment(),
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise RuntimeError(f"Could not confirm the workspace git root: {exc}")
+    toplevel = result.stdout.strip()
+    if result.returncode != 0 or not toplevel or Path(toplevel).resolve() != ws:
+        raise RuntimeError(
+            f"The workspace copy is not its own git repository root (git reports "
+            f"{toplevel or result.stderr.strip()!r}). Relay will not run git there."
+        )
+
+
+def _windows_tool(name: str) -> str:
+    """Absolute path of a Windows system tool, so PATH cannot substitute it."""
+    system32 = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / name
+    return str(system32) if system32.is_file() else name
+
+
+def _kill_process_tree(proc: subprocess.Popen) -> None:
+    """Terminate a worker and everything it started.
+
+    On Windows the Claude CLI is usually a .cmd shim: Popen.kill() ends only
+    cmd.exe, and the real worker keeps running and holding the output pipes,
+    so a timeout would not take effect.  taskkill /T ends the whole tree.
+    """
+    if sys.platform == "win32" and isinstance(getattr(proc, "pid", None), int):
+        try:
+            subprocess.run(
+                [_windows_tool("taskkill.exe"), "/PID", str(proc.pid), "/T", "/F"],
+                capture_output=True, timeout=30,
+            )
+        except (OSError, subprocess.SubprocessError):
+            pass
+    try:
+        proc.kill()
+    except OSError:
+        pass
+
+
 class ExecutionEngine:
     def __init__(
         self,
@@ -448,6 +506,7 @@ class ExecutionEngine:
 
     def _checkout_base_ref(self, base_ref: str, workspace: str) -> None:
         """Check out base_ref in the workspace copy. Raises RuntimeError on failure."""
+        _assert_git_root(workspace)
         try:
             # Batch 3 (E-12): trailing "--" forces base_ref to be read as a
             # revision, never a path; policy has already rejected option-like
@@ -621,8 +680,11 @@ class ExecutionEngine:
                 execution.stderr = err or ""
                 execution.exit_code = proc.returncode
             except subprocess.TimeoutExpired:
-                proc.kill()
-                out, err = proc.communicate()
+                _kill_process_tree(proc)
+                try:
+                    out, err = proc.communicate(timeout=30)
+                except subprocess.TimeoutExpired:
+                    out, err = "", ""
                 execution.stdout = out or ""
                 execution.stderr = err or ""
                 execution.exit_code = -1

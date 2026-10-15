@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -312,17 +313,72 @@ class TestBaseRef:
         assert PolicyEngine().validate_task(sample_task).allowed is True
 
     def test_checkout_uses_separator_and_curated_env(self, tmp_db, audit, policy, tmp_path):
+        ws = tmp_path / "ws"
+        (ws / ".git").mkdir(parents=True)
         seen = {}
 
         def fake_run(cmd, **kwargs):
             seen["cmd"] = cmd
             seen["env"] = kwargs.get("env")
-            return subprocess.CompletedProcess(cmd, 0, "", "")
+            out = str(ws) if cmd[:2] == ["git", "rev-parse"] else ""
+            return subprocess.CompletedProcess(cmd, 0, out, "")
 
         with patch("subprocess.run", fake_run):
-            _REAL_CHECKOUT_BASE_REF(ExecutionEngine(tmp_db, audit, policy), "main", str(tmp_path))
+            _REAL_CHECKOUT_BASE_REF(ExecutionEngine(tmp_db, audit, policy), "main", str(ws))
         assert seen["cmd"] == ["git", "checkout", "main", "--"]
         assert seen["env"] == _worker_environment()
+
+
+class TestGitRootGuard:
+    """Batch 5 review B1: git must never act on a repository enclosing the workspace."""
+
+    def _git(self, *args, cwd):
+        subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t", *args],
+                       cwd=str(cwd), check=True, capture_output=True, text=True)
+
+    def test_non_root_repository_is_refused_and_enclosing_repo_untouched(
+        self, tmp_db, audit, policy, sample_task, tmp_path
+    ):
+        outer = tmp_path / "outer"
+        target = outer / "not-a-repo"
+        target.mkdir(parents=True)
+        (target / "test_x.py").write_text("def test_x():\n    pass\n")
+        self._git("init", "-b", "main", cwd=outer)
+        self._git("add", ".", cwd=outer)
+        self._git("commit", "-m", "init", cwd=outer)
+        self._git("checkout", "-b", "feature", cwd=outer)
+
+        sample_task.repository = str(target)
+
+        engine = ExecutionEngine(tmp_db, audit, policy)
+        with patch.object(ExecutionEngine, "_checkout_base_ref", _REAL_CHECKOUT_BASE_REF), \
+             patch("subprocess.Popen") as popen:
+            execution = engine.run(sample_task, outer / "workspaces")
+
+        assert execution.status == ExecutionStatus.FAILED
+        assert "not the root of a git repository" in execution.error
+        popen.assert_not_called()
+        branch = subprocess.run(["git", "branch", "--show-current"], cwd=str(outer),
+                                capture_output=True, text=True).stdout.strip()
+        assert branch == "feature", "the enclosing repository's branch must not change"
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="Windows .cmd process-tree behaviour")
+    def test_timeout_kills_the_whole_worker_tree(self, tmp_path):
+        """Batch 5 review S1: killing a .cmd shim must also end the real worker,
+        otherwise communicate() waits for it and --timeout is not enforced."""
+        import time
+
+        from relay.executor import _kill_process_tree
+
+        shim = tmp_path / "worker.cmd"
+        shim.write_text(f'@"{sys.executable}" -c "import time; time.sleep(30)"\r\n')
+        proc = subprocess.Popen([str(shim)], stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, text=True)
+        time.sleep(1.0)
+        started = time.monotonic()
+        _kill_process_tree(proc)
+        proc.communicate(timeout=20)
+        assert time.monotonic() - started < 10
 
 
 # ── E-13: required_tests containment before baseline collection ──────────────

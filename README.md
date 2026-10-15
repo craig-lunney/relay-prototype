@@ -1,235 +1,122 @@
-# Project Relay — Prototype 1 (P1-A: Worker Configuration Isolation)
+# Agent to Agent — Relay and the A2A protocol ledger
 
-Research prototype for safe AI-to-AI engineering collaboration.
+A research prototype for **controlled AI-to-AI software engineering**: a human
+defines the work, ChatGPT specifies and reviews it, Claude Code implements it,
+and software — not the agents' own reports — decides what actually happened.
 
 ```
-Human-defined task
-  → Relay policy validation
-  → Claude Code execution (constrained subprocess)
-  → isolated test repository
-  → independent verification
-  → structured implementation result
-  → durable audit trail
+Craig (human)  ──defines task, approves gates, decides──┐
+ChatGPT        ──specifies, reviews                      │   A2A ledger (a2a/)
+Claude Code    ──implements                              │   who did each step, in what role,
+                                                         │   on what evidence
+                 Relay (relay/) ◄────────────────────────┘
+                 policy → isolated workspace → Claude worker
+                 → independent verification → audit trail
 ```
 
-This is a **research prototype**, not a production system.
+**The principle:** an agent can *report* that work is done; that report is not
+proof. Relay verifies independently, and the ledger records every protocol step
+with a named actor and role.
+
+This is a **research prototype**, not a production system. Read
+[docs/limitations.md](docs/limitations.md) before relying on it.
 
 ---
+
+## What is in the box
+
+| Component | What it does | Authoritative for |
+|---|---|---|
+| **Relay** (`relay/`) | Validates a task against policy, copies the target repository into a disposable workspace under an exclusive lease, runs the Claude Code worker there with a restricted tool allowlist and curated environment, then **independently verifies** the result: workspace integrity (hash manifest), protected tests and test configuration, required tests, acceptance criteria. Records everything in an append-only audit log. | Execution state of a Relay task (`relay.db`) |
+| **A2A ledger** (`a2a/`) | Tracks a task through the frozen [A2A protocol v0.2](docs/a2a-protocol-v0.2.md): enforces the state graph, tier paths, which role may take each step, required evidence, the Relay evidence link, and the T3 human re-run — and records each step in an append-only history. | Protocol state of an A2A task (`a2a.db`) |
+
+The two are linked **by reference**: an A2A task can only enter review (T2/T3)
+or Gate 2 (T1) by citing a Relay task that is `COMPLETED`. A2A reads the Relay
+database read-only; Relay knows nothing about A2A.
+
+## What is deliberately not implemented
+
+No pushing, merging, pull requests, deployment or publishing. No autonomous
+approval. No GitHub API integration (the ledger stores GitHub URLs as evidence
+references; it does not read GitHub). No OS-level sandbox for the worker. No
+operator authentication. Full list and reasoning: [docs/limitations.md](docs/limitations.md).
 
 ## Safety boundaries
 
-This prototype will **never**:
-- Modify the Lunneys Social repository or any production system
-- Push, merge, or create pull requests
-- Access production credentials
-- Use `--dangerously-skip-permissions`
-- Allow a task to grant itself capabilities beyond Relay policy
-- Accept Claude's "COMPLETED" assertion without independent verification
+- Relay never pushes, merges, creates PRs or deploys. It copies the target
+  repository into a disposable workspace and runs the worker there. The target
+  must be the root of its own git repository, and Relay's own git commands run
+  only in a copy it has confirmed is a git root.
+- A task cannot grant itself capabilities: requests outside policy (e.g.
+  `push`) are rejected and unknown capabilities are denied. The worker's tool
+  allowlist is fixed by Relay, not by the task.
+- The worker's report is evidence, never authority. Verification fails if the
+  worker alters existing tests, test configuration or Python start-up hooks,
+  makes no change, creates undeclared files, or if required tests fail.
+- Acceptance criteria Relay cannot check are `UNVERIFIED` and need an explicit
+  human acknowledgement before a task is `COMPLETED`.
+- In the ledger, an actor may hold only one role per task (no self-review or
+  self-approval), Gate 1, Gate 2 and SHIPPED are Human steps, and T3 tasks need a
+  recorded human re-run before SHIPPED.
 
-The only repository Claude modifies is the disposable `test-repository/` copy
-inside this project.
-
----
-
-## Architecture
-
-```
-ChatGPT (planning)
-    ↓ task definition JSON
-Relay CLI (policy engine + orchestrator)
-    ↓ constrained subprocess
-Claude Code (implementation worker)
-    ↓ git diff + pytest
-Relay Verifier (independent verification)
-    ↓ 
-SQLite audit log (append-only, worker-inaccessible)
-```
-
-**Fundamental rules:**
-1. Agents propose actions. Relay policy authorises actions.
-2. Agent assertions are evidence, not authoritative state.
+These are **process controls on a single machine**, not a security boundary
+against a hostile local user or process — see the limitations document.
 
 ---
 
-## Structure
+## Install
 
-```
-relay-prototype/
-├── relay/
-│   ├── models.py      — Task, Execution, ImplementationReport, AuditEvent, enums
-│   ├── policy.py      — PolicyEngine (fail-closed, Prototype 0 capabilities)
-│   ├── state.py       — SQLite state manager (append-only events)
-│   ├── audit.py       — AuditLog (Relay-only write path)
-│   ├── executor.py    — ExecutionEngine (Claude subprocess + lease)
-│   ├── verifier.py    — Verifier (independent git + test inspection)
-│   ├── recovery.py    — RecoveryEngine (interrupted execution detection)
-│   └── cli.py         — relay CLI (create-task / run-task / status / audit / recover)
-├── schemas/
-│   ├── task.schema.json    — machine-readable task definition schema
-│   └── report.schema.json  — machine-readable implementation report schema
-├── tests/             — 95 tests covering all modules + 15 security tests
-├── test-repository/   — disposable target: calculator.py with deliberate bug
-└── sample_task.json   — starter task definition
-```
-
----
-
-## Prototype 0 capabilities
-
-| Capability | Allowed |
-|------------|---------|
-| `read_repository` | ✓ |
-| `modify_working_tree` | ✓ |
-| `run_tests` | ✓ |
-| `push` | ✗ |
-| `merge` | ✗ |
-| `deploy` | ✗ |
-| `modify_main` | ✗ |
-| `access_production` | ✗ |
-| `modify_relay_policy` | ✗ |
-
-Unknown capabilities → **DENY** (fail-closed, no guessing).
-
----
-
-## State model
-
-```
-CREATED → VALIDATING → READY → RUNNING → VERIFYING → COMPLETED
-                     ↘ REJECTED        ↘ FAILED
-                                       ↘ TIMEOUT → READY (retry)
-                                       ↘ RECOVERY_REQUIRED → READY (operator)
-```
-
-Relay owns all transitions. Claude cannot declare a task COMPLETED.
-
-Since Batch 1, a task whose automated verification passes but which has
-acceptance criteria Relay cannot check enters `ACCEPTANCE_REQUIRED` and needs
-`relay acknowledge-criteria` before it is COMPLETED. Verification also fails if
-the worker alters protected tests or test configuration. See
-[docs/verification-integrity.md](docs/verification-integrity.md).
-
----
-
-## Quick start
+Requires Python 3.11+ and git. Claude Code CLI (`claude`) is needed only for
+real worker runs.
 
 ```bash
-cd relay-prototype
+python -m venv .venv
+.venv\Scripts\activate          # Windows;  source .venv/bin/activate elsewhere
 pip install -e ".[dev]"
-
-# Initialize the test-repository git repo
-cd test-repository && git init && git add . && git commit -m "initial" && cd ..
-
-# Edit sample_task.json — set "repository" to the absolute path of test-repository/
-
-# Create a task
-relay --db relay.db create-task sample_task.json
-
-# Run it (requires `claude` on PATH)
-relay --db relay.db run-task TASK-XXXXXXXX --workspace ./workspaces
-
-# Inspect the audit trail
-relay --db relay.db audit
-
-# Check for interrupted executions
-relay --db relay.db recover
+relay --help
+a2a --help
 ```
 
----
+`python -m relay` and `python -m a2a` work without installing.
 
-## Running tests
+## Run the tests
 
 ```bash
-pytest tests/ -v
+python -m pytest -q
 ```
 
-100 tests (95 Prototype 0 + 5 P1-A isolation tests), including 15 security tests.
-The test-repository does **not** need to be git-initialised for the tests —
-`conftest.py` does this per-test in a temp directory.
+The suite never launches the real Claude CLI: end-to-end tests replace it with
+a scripted fake worker (`tests/fake_worker.py`). See
+[docs/development.md](docs/development.md).
 
----
+## Run the acceptance demonstration (no API credit used)
 
-## P1-A: Worker Configuration Isolation
+```bash
+python demo/acceptance_demo.py
+```
 
-### CF-01
+Drives the real `relay` and `a2a` CLIs end to end against a throwaway copy of
+`test-repository/`, with the fake worker, covering the success path and the
+failure paths (test weakening, forbidden capability, unapproved task, timeout
+and retry, crash recovery, T2 and T3 protocol walk-throughs). It writes a
+transcript; the committed one is in
+[docs/acceptance/acceptance-transcript.md](docs/acceptance/acceptance-transcript.md).
 
-**Finding (Prototype 0 acceptance):** The operator's global
-`~/.claude/CLAUDE.md` was loaded by a Claude subprocess launched by Relay.
-That file contained session-start instructions unrelated to the Relay task
-(invoking a lunneys-magento skill), causing the worker to begin an unrelated
-workflow instead of executing the assigned engineering task.
+## Operating it
 
-**Root cause:** `executor.py` passed no `--bare` flag to the Claude subprocess
-and no isolated configuration directory. Claude performed CLAUDE.md
-auto-discovery in its default mode, finding and loading the operator's global
-`~/.claude/CLAUDE.md`.
+Step-by-step instructions for a real run — preparing a task, approval,
+execution, reviewing verification, acknowledging criteria, recovery, and
+recording each protocol step in the ledger — are in the
+**[operator guide](docs/operator-guide.md)**.
 
-### How Relay isolates worker configuration
+## Documentation map
 
-`_invoke_claude()` now passes two additional flags to the Claude CLI:
-
-| Flag | Effect |
-|------|--------|
-| `--bare` | Disables CLAUDE.md auto-discovery, hooks, auto-memory, keychain reads, and plugin sync. The operator's global `~/.claude/CLAUDE.md` is never loaded. |
-| `--add-dir relay/worker_config/` | Explicitly loads the Relay-owned `CLAUDE.md` from the worker config directory. This is the only configuration file the worker sees. |
-
-The isolation is enforced at the process boundary (CLI flags), not by prompt
-instruction. A worker cannot opt out of `--bare` by reading a file.
-
-### Worker configuration (`relay/worker_config/`)
-
-**Contains:**
-- `CLAUDE.md` — minimal task context. Tells the worker it is in an isolated
-  workspace and must execute only the prompt-assigned task.
-
-**Deliberately does NOT contain:**
-- Any copy of the operator's global configuration
-- API keys, passwords, tokens, or any credential values
-- OAuth state, keychain entries, or authentication files
-- MCP server configurations
-- Hooks or plugin definitions
-
-**Security rationale:** The worker configuration is minimal by design. Its only
-role is to replace the auto-discovered global config with a benign, Relay-owned
-context. Operators should not add credentials here — use `ANTHROPIC_API_KEY`
-in the process environment for API authentication.
-
-**Note on authentication:** `--bare` requires `ANTHROPIC_API_KEY` to be set in
-the environment for Claude API calls. OAuth credentials stored in the keychain
-are not read in `--bare` mode. This is a known limitation of P1-A; credential
-management is out of scope for this prototype.
-
-### Test coverage (CF-01)
-
-| Test | What it proves |
-|------|---------------|
-| `test_global_config_not_inherited` | `--bare` is in the command; fake global config path is absent |
-| `test_worker_config_is_used` | `--add-dir` points to `relay/worker_config/`; marker present in CLAUDE.md |
-| `test_no_credentials_in_worker_config` | No forbidden files; no credential patterns in CLAUDE.md |
-| Existing tests (95) | `_invoke_claude()` change is backwards-compatible; all pass |
-| `test_cf01_global_config_cannot_override_worker_config` | Full CF-01 simulation: fake global config + redirected HOME; `--bare` + correct `--add-dir` verified |
-
-All tests inspect the actual `subprocess.Popen` arguments, not just Python
-variables, verifying the process-level configuration boundary.
-
----
-
-## Security test map
-
-| # | Test | What it proves |
-|---|------|---------------|
-| 1 | `test_sec1` | Valid capability allowed |
-| 2 | `test_sec2` | Unknown capability denied (fail-closed) |
-| 3 | `test_sec3` | All forbidden capabilities denied |
-| 4 | `test_sec4` | Task cannot grant itself capabilities |
-| 5 | `test_sec5` | Agent assertion cannot substitute human approval |
-| 6 | `test_sec6` | `modify_main` denied |
-| 7 | `test_sec7` | `push` denied |
-| 8 | `test_sec8` | `deploy` / `publish` denied |
-| 9 | `test_sec9` | Timeout recorded with correct status + audit event |
-| 10 | `test_sec10` | Failed execution preserves stdout/stderr/timestamps for recovery |
-| 11 | `test_sec11` | Malicious repo comment cannot alter Relay policy |
-| 12 | `test_sec12` | Claude's "COMPLETED" assertion rejected without verification |
-| 13 | `test_sec13` | Second execution blocked when workspace lease is active |
-| 14 | `test_sec14` | Stale execution → RECOVERY_REQUIRED, not silent COMPLETED |
-| 15 | `test_sec15` | Audit records have no worker-accessible delete/update path |
+| Document | For |
+|---|---|
+| [docs/operator-guide.md](docs/operator-guide.md) | Running tasks, reading results, recovering, using the ledger |
+| [docs/limitations.md](docs/limitations.md) | What is not enforced or not implemented, and why |
+| [docs/verification-integrity.md](docs/verification-integrity.md) | How Relay decides what the worker changed and what it may not change |
+| [docs/development.md](docs/development.md) | Code layout, test strategy, conventions |
+| [docs/a2a-dev.md](docs/a2a-dev.md) | A2A package reference |
+| [docs/a2a-protocol-v0.2.md](docs/a2a-protocol-v0.2.md) | The frozen collaboration protocol (authoritative, unchanged) |
+| [docs/history.md](docs/history.md) | How the prototype got here (P0 → P1 → v1 batches) |
