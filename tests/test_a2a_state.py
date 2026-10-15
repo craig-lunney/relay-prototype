@@ -8,6 +8,8 @@ from datetime import datetime, timezone
 
 import pytest
 
+from tests.a2a_support import fake_relay_lookup, transition
+
 from a2a.models import A2AProtocolState, A2ATask, A2ATaskTier
 from a2a.state import A2AInvalidTransitionError, A2AStateManager
 
@@ -32,7 +34,7 @@ def _task(
 
 @pytest.fixture
 def db(tmp_path) -> A2AStateManager:
-    return A2AStateManager(tmp_path / "a2a_test.db")
+    return A2AStateManager(tmp_path / "a2a_test.db", relay_status_lookup=fake_relay_lookup)
 
 
 # ---------------------------------------------------------------------------
@@ -122,7 +124,7 @@ def test_list_tasks_ordered_by_created_at(db):
 def test_t1_draft_to_in_implementation(db):
     t = _task(tier=A2ATaskTier.T1)
     db.create_task(t)
-    updated = db.transition_state(t.task_id, A2AProtocolState.IN_IMPLEMENTATION)
+    updated = transition(db, t.task_id, A2AProtocolState.IN_IMPLEMENTATION)
     assert updated.state == A2AProtocolState.IN_IMPLEMENTATION
 
 
@@ -135,7 +137,7 @@ def test_t1_full_happy_path(db):
         A2AProtocolState.SHIPPED,
         A2AProtocolState.CLOSED,
     ]:
-        db.transition_state(t.task_id, s)
+        transition(db, t.task_id, s)
     assert db.get_task(t.task_id).state == A2AProtocolState.CLOSED
 
 
@@ -151,7 +153,7 @@ def test_t1_post_deploy_failure_and_retry(db):
         A2AProtocolState.SHIPPED,
         A2AProtocolState.CLOSED,
     ]:
-        db.transition_state(t.task_id, s)
+        transition(db, t.task_id, s)
     assert db.get_task(t.task_id).state == A2AProtocolState.CLOSED
 
 
@@ -162,7 +164,7 @@ def test_t1_post_deploy_failure_and_retry(db):
 def test_t2_draft_to_speccing(db):
     t = _task(tier=A2ATaskTier.T2)
     db.create_task(t)
-    updated = db.transition_state(t.task_id, A2AProtocolState.SPECCING)
+    updated = transition(db, t.task_id, A2AProtocolState.SPECCING)
     assert updated.state == A2AProtocolState.SPECCING
 
 
@@ -178,16 +180,16 @@ def test_t2_full_happy_path(db):
         A2AProtocolState.SHIPPED,
         A2AProtocolState.CLOSED,
     ]:
-        db.transition_state(t.task_id, s)
+        transition(db, t.task_id, s)
     assert db.get_task(t.task_id).state == A2AProtocolState.CLOSED
 
 
 def test_gate_1_rejection_returns_to_draft(db):
     t = _task()
     db.create_task(t)
-    db.transition_state(t.task_id, A2AProtocolState.SPECCING)
-    db.transition_state(t.task_id, A2AProtocolState.AWAITING_GATE_1)
-    db.transition_state(t.task_id, A2AProtocolState.DRAFT)
+    transition(db, t.task_id, A2AProtocolState.SPECCING)
+    transition(db, t.task_id, A2AProtocolState.AWAITING_GATE_1)
+    transition(db, t.task_id, A2AProtocolState.DRAFT)
     assert db.get_task(t.task_id).state == A2AProtocolState.DRAFT
 
 
@@ -206,7 +208,7 @@ def test_revision_cycle_t2(db):
         A2AProtocolState.SHIPPED,
         A2AProtocolState.CLOSED,
     ]:
-        db.transition_state(t.task_id, s)
+        transition(db, t.task_id, s)
     assert db.get_task(t.task_id).state == A2AProtocolState.CLOSED
 
 
@@ -224,7 +226,7 @@ def test_blocked_by_discovery_resolves_to_in_implementation(db):
         A2AProtocolState.BLOCKED_BY_DISCOVERY,
         A2AProtocolState.IN_IMPLEMENTATION,
     ]:
-        db.transition_state(t.task_id, s)
+        transition(db, t.task_id, s)
     assert db.get_task(t.task_id).state == A2AProtocolState.IN_IMPLEMENTATION
 
 
@@ -236,7 +238,7 @@ def test_blocked_by_discovery_can_close(db):
         A2AProtocolState.BLOCKED_BY_DISCOVERY,
         A2AProtocolState.CLOSED,
     ]:
-        db.transition_state(t.task_id, s)
+        transition(db, t.task_id, s)
     assert db.get_task(t.task_id).state == A2AProtocolState.CLOSED
 
 
@@ -248,21 +250,21 @@ def test_invalid_transition_raises(db):
     t = _task()
     db.create_task(t)
     with pytest.raises(A2AInvalidTransitionError):
-        db.transition_state(t.task_id, A2AProtocolState.CLOSED)
+        transition(db, t.task_id, A2AProtocolState.CLOSED)
 
 
 def test_invalid_transition_error_message_names_states(db):
     t = _task()
     db.create_task(t)
     with pytest.raises(A2AInvalidTransitionError, match="DRAFT.*CLOSED"):
-        db.transition_state(t.task_id, A2AProtocolState.CLOSED)
+        transition(db, t.task_id, A2AProtocolState.CLOSED)
 
 
 def test_invalid_transition_does_not_corrupt_state(db):
     t = _task()
     db.create_task(t)
     with pytest.raises(A2AInvalidTransitionError):
-        db.transition_state(t.task_id, A2AProtocolState.SHIPPED)
+        transition(db, t.task_id, A2AProtocolState.SHIPPED)
     assert db.get_task(t.task_id).state == A2AProtocolState.DRAFT
 
 
@@ -280,7 +282,7 @@ def test_draft_rejects_invalid_targets(db, bad_target):
     t = _task()
     db.create_task(t)
     with pytest.raises(A2AInvalidTransitionError):
-        db.transition_state(t.task_id, bad_target)
+        transition(db, t.task_id, bad_target)
 
 
 def test_closed_rejects_all_targets(db):
@@ -292,15 +294,15 @@ def test_closed_rejects_all_targets(db):
         A2AProtocolState.SHIPPED,
         A2AProtocolState.CLOSED,
     ]:
-        db.transition_state(t.task_id, s)
+        transition(db, t.task_id, s)
     for target in A2AProtocolState:
         with pytest.raises(A2AInvalidTransitionError):
-            db.transition_state(t.task_id, target)
+            transition(db, t.task_id, target)
 
 
 def test_transition_nonexistent_task_raises(db):
     with pytest.raises(A2AInvalidTransitionError, match="not found"):
-        db.transition_state("A2A-NOTFOUND", A2AProtocolState.SPECCING)
+        transition(db, "A2A-NOTFOUND", A2AProtocolState.SPECCING)
 
 
 # ---------------------------------------------------------------------------
@@ -310,7 +312,7 @@ def test_transition_nonexistent_task_raises(db):
 def test_transition_returns_task_with_new_state(db):
     t = _task()
     db.create_task(t)
-    updated = db.transition_state(t.task_id, A2AProtocolState.SPECCING)
+    updated = transition(db, t.task_id, A2AProtocolState.SPECCING)
     assert updated.task_id == t.task_id
     assert updated.state == A2AProtocolState.SPECCING
 
@@ -320,7 +322,7 @@ def test_transition_updates_updated_at(db):
     db.create_task(t)
     before = db.get_task(t.task_id).updated_at
     time.sleep(0.015)
-    db.transition_state(t.task_id, A2AProtocolState.SPECCING)
+    transition(db, t.task_id, A2AProtocolState.SPECCING)
     after = db.get_task(t.task_id).updated_at
     assert after > before
 
@@ -329,14 +331,14 @@ def test_transition_preserves_created_at(db):
     t = _task()
     db.create_task(t)
     created = db.get_task(t.task_id).created_at
-    db.transition_state(t.task_id, A2AProtocolState.SPECCING)
+    transition(db, t.task_id, A2AProtocolState.SPECCING)
     assert db.get_task(t.task_id).created_at == created
 
 
 def test_transition_preserves_immutable_fields(db):
     t = _task(tier=A2ATaskTier.T3, title="Immutable title")
     db.create_task(t)
-    db.transition_state(t.task_id, A2AProtocolState.SPECCING)
+    transition(db, t.task_id, A2AProtocolState.SPECCING)
     r = db.get_task(t.task_id)
     assert r.title == "Immutable title"
     assert r.tier == A2ATaskTier.T3
@@ -347,8 +349,8 @@ def test_transition_preserves_immutable_fields(db):
 def test_get_reflects_latest_state_after_transition(db):
     t = _task()
     db.create_task(t)
-    db.transition_state(t.task_id, A2AProtocolState.SPECCING)
-    db.transition_state(t.task_id, A2AProtocolState.AWAITING_GATE_1)
+    transition(db, t.task_id, A2AProtocolState.SPECCING)
+    transition(db, t.task_id, A2AProtocolState.AWAITING_GATE_1)
     assert db.get_task(t.task_id).state == A2AProtocolState.AWAITING_GATE_1
 
 
@@ -362,7 +364,7 @@ def test_task_persists_across_connections(tmp_path):
 
     sm1 = A2AStateManager(db_path)
     sm1.create_task(t)
-    sm1.transition_state(t.task_id, A2AProtocolState.SPECCING)
+    transition(sm1, t.task_id, A2AProtocolState.SPECCING)
 
     sm2 = A2AStateManager(db_path)
     r = sm2.get_task(t.task_id)
@@ -388,8 +390,8 @@ def test_state_written_by_one_connection_visible_to_another(tmp_path):
     sm1 = A2AStateManager(db_path)
     sm2 = A2AStateManager(db_path)
     sm1.create_task(t)
-    sm1.transition_state(t.task_id, A2AProtocolState.SPECCING)
-    sm1.transition_state(t.task_id, A2AProtocolState.AWAITING_GATE_1)
+    transition(sm1, t.task_id, A2AProtocolState.SPECCING)
+    transition(sm1, t.task_id, A2AProtocolState.AWAITING_GATE_1)
     r = sm2.get_task(t.task_id)
     assert r.state == A2AProtocolState.AWAITING_GATE_1
 
@@ -418,7 +420,7 @@ def test_concurrent_transition_one_wins(tmp_path):
     def attempt() -> None:
         sm = A2AStateManager(db_path)
         try:
-            sm.transition_state(t.task_id, A2AProtocolState.SPECCING)
+            transition(sm, t.task_id, A2AProtocolState.SPECCING)
             with lock:
                 successes.append(1)
         except A2AInvalidTransitionError:

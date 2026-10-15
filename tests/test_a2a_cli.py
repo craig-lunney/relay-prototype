@@ -6,6 +6,13 @@ import time
 
 import pytest
 
+from tests.a2a_support import (
+    advance,
+    fake_relay_lookup,
+    make_relay_db,
+    protocol_attestation,
+)
+
 from a2a.cli import cmd_advance, cmd_create_task, cmd_get_task, cmd_list_tasks
 from a2a.models import A2AProtocolState, A2ATaskTier
 from a2a.service import A2AService
@@ -27,6 +34,18 @@ def _args(**kwargs) -> argparse.Namespace:
         to_state=None,
     )
     defaults.update(kwargs)
+    if defaults["to_state"] and defaults["db"] and "actor" not in kwargs:
+        # Walk the protocol as it prescribes: attest the role the protocol
+        # assigns to this step, and cite a COMPLETED task in a real Relay DB
+        # where the step needs implementation evidence.
+        sm = A2AStateManager(defaults["db"], relay_status_lookup=fake_relay_lookup)
+        att = protocol_attestation(sm, defaults["task_id"], A2AProtocolState(defaults["to_state"]))
+        defaults.update(actor=att.actor, role=att.role.value, reason=att.reason,
+                        evidence=att.evidence_ref, relay_task=att.relay_task_id)
+        if att.relay_task_id:
+            relay_db = defaults["db"] + ".relay.db"
+            make_relay_db(relay_db, completed=[att.relay_task_id])
+            defaults["relay_db"] = relay_db
     return argparse.Namespace(**defaults)
 
 
@@ -474,9 +493,9 @@ def _advance_to_in_implementation(db_path: str, tier: str = "T2") -> str:
         tier=A2ATaskTier(tier),
         github_issue_url="https://github.com/org/repo/issues/1",
     )
-    svc.advance(task.task_id, A2AProtocolState.SPECCING)
-    svc.advance(task.task_id, A2AProtocolState.AWAITING_GATE_1)
-    svc.advance(task.task_id, A2AProtocolState.IN_IMPLEMENTATION)
+    advance(svc, task.task_id, A2AProtocolState.SPECCING)
+    advance(svc, task.task_id, A2AProtocolState.AWAITING_GATE_1)
+    advance(svc, task.task_id, A2AProtocolState.IN_IMPLEMENTATION)
     return task.task_id
 
 

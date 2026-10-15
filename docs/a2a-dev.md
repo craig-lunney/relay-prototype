@@ -1,7 +1,10 @@
-# A2A Implementation — Developer Reference
+# A2A Implementation: Developer Reference
 
-This document covers the `a2a/` Python package. For the governance protocol that this code
-implements, see `docs/a2a-protocol-v0.2.md` (frozen — do not modify).
+This document covers the `a2a/` Python package, the **attested ledger** for the A2A collaboration protocol.
+
+The protocol itself is defined in `docs/a2a-protocol-v0.2.md`. That document is frozen: do not modify it.
+
+What the ledger does **not** enforce is listed in `docs/limitations.md`.
 
 ---
 
@@ -9,324 +12,211 @@ implements, see `docs/a2a-protocol-v0.2.md` (frozen — do not modify).
 
 ```
 a2a/
-├── __init__.py       — package marker
-├── models.py         — A2ATaskTier, A2AProtocolState, ALLOWED_A2A_TRANSITIONS, A2ATask
-├── state.py          — A2AStateManager (SQLite persistence), A2AInvalidTransitionError
-├── service.py        — A2AService (lifecycle entry point), A2ATaskNotFoundError, A2ATransitionError
-└── cli.py            — argparse CLI (create-task, get-task, list-tasks, advance); entry point: `a2a`
+├── models.py    A2ATaskTier, A2AProtocolState, ALLOWED_A2A_TRANSITIONS (graph), A2ATask
+├── protocol.py  A2ARole and RULES: who may take each step, on which tiers, with what evidence
+├── state.py     A2AStateManager (SQLite ledger; enforces everything), A2AAttestation,
+│                history/verification records, relay_status_from_db
+├── service.py   A2AService (domain errors, generated IDs), A2A*Error
+└── cli.py       `a2a` CLI: create-task, get-task, list-tasks, advance,
+                 record-human-verification, check
 ```
 
 ---
 
-## State model
+## Model
 
-`A2AProtocolState` enumerates the ten states from §8 of the protocol:
+### States
 
-| State | Description |
+`A2AProtocolState` holds the ten states from protocol §8:
+
+| State | Meaning |
 |---|---|
-| `DRAFT` | Task created; AC not yet confirmed |
-| `SPECCING` | T2/T3 — ChatGPT authoring CCP Spec |
-| `AWAITING_GATE_1` | T2/T3 — Human reviewing spec before approving implementation |
-| `IN_IMPLEMENTATION` | Claude implementing |
-| `BLOCKED_BY_DISCOVERY` | Discovery found; Human must resolve before implementation resumes |
-| `UNDER_REVIEW` | T2/T3 — PR open; ChatGPT reviewing against AC |
-| `REVISION_NEEDED` | Review blocked; Claude must revise and re-post evidence |
-| `AWAITING_GATE_2` | PR ready; Human merge decision pending |
-| `SHIPPED` | Merged + deployed + post-deploy AC passed |
-| `CLOSED` | Terminal — Issue closed by Human |
+| `DRAFT` | Task created |
+| `SPECCING` | ChatGPT is writing the CCP spec (T2/T3) |
+| `AWAITING_GATE_1` | The Human is reviewing the spec (T2/T3) |
+| `IN_IMPLEMENTATION` | Claude is implementing |
+| `BLOCKED_BY_DISCOVERY` | A discovery is awaiting a Human decision |
+| `UNDER_REVIEW` | ChatGPT is reviewing the PR against the acceptance criteria (T2/T3) |
+| `REVISION_NEEDED` | The review blocked, or post-deploy acceptance criteria failed |
+| `AWAITING_GATE_2` | The Human's merge decision is pending |
+| `SHIPPED` | Merged, deployed, and post-deploy acceptance criteria passed |
+| `CLOSED` | Terminal |
 
-`ALLOWED_A2A_TRANSITIONS` is a `dict[A2AProtocolState, frozenset[A2AProtocolState]]`
-following the same pattern as `relay/models.py:ALLOWED_TRANSITIONS`. The dict captures
-the **union** of T1 and T2/T3 transitions — the abstract graph is intentionally
-tier-agnostic. Tier-specific path enforcement is applied by `A2AService.advance()`,
-which sits above the state layer.
+### Transitions and tiers
 
-### Tier-specific path enforcement (`A2AService.advance()`)
+`ALLOWED_A2A_TRANSITIONS` is the union graph for all tiers.
 
-The service enforces three additional constraints before delegating to the state layer:
+`protocol.RULES` has exactly one entry per graph edge; a test enforces this. Each `TransitionRule` names:
 
-1. **T1 tasks** may never advance to `SPECCING`, `AWAITING_GATE_1`, or `UNDER_REVIEW`
-   (T2/T3-only states). The abstract graph permits these transitions, but the service
-   rejects them with `A2ATransitionError` when the task tier is T1.
+- the **roles** that may trigger the step (`HUMAN`, `CHATGPT`, `CLAUDE`; §2, §8, §14);
+- the **tiers** the step belongs to (§3);
+- whether a **reason** or **evidence reference** must be attested;
+- whether a **COMPLETED Relay task** must be cited.
 
-2. **T2/T3 tasks** may not advance directly from `DRAFT` to `IN_IMPLEMENTATION`
-   (the T1 shortcut). T2/T3 tasks must reach `IN_IMPLEMENTATION` via the full
-   `SPECCING → AWAITING_GATE_1` path. Re-entry into `IN_IMPLEMENTATION` from
-   `AWAITING_GATE_1`, `REVISION_NEEDED`, or `BLOCKED_BY_DISCOVERY` is not affected.
-
-3. **T2/T3 tasks** may not advance directly from `IN_IMPLEMENTATION` to
-   `AWAITING_GATE_2`, skipping `UNDER_REVIEW` (the T1 shortcut through Gate 2).
-   T2/T3 tasks must pass through `UNDER_REVIEW` first:
-   `IN_IMPLEMENTATION → UNDER_REVIEW → AWAITING_GATE_2`. This ensures the ChatGPT
-   review step is never bypassed for tasks that require it.
-
-All three checks raise `A2ATransitionError` with a reason string that names the violated
-tier constraint. The state layer (`A2AStateManager`) remains tier-agnostic.
-
-### T1 path (Gate 2 only)
-
-```
-DRAFT → IN_IMPLEMENTATION → AWAITING_GATE_2 → SHIPPED → CLOSED
-```
-
-T1 tasks skip SPECCING, AWAITING_GATE_1, and UNDER_REVIEW entirely.
-
-### T2/T3 path (full protocol)
-
-```
-DRAFT → SPECCING → AWAITING_GATE_1 → IN_IMPLEMENTATION
-      → UNDER_REVIEW → AWAITING_GATE_2 → SHIPPED → CLOSED
-```
-
-### BLOCKED_BY_DISCOVERY (all tiers)
-
-Any task in `IN_IMPLEMENTATION` may transition to `BLOCKED_BY_DISCOVERY` when Claude
-finds something not covered by the agreed AC or CCP Spec. Resolution: Human posts
-decision on the Issue; task returns to `IN_IMPLEMENTATION`. If abandoned: `CLOSED`.
-
----
-
-## Risk tiers
-
-`A2ATaskTier` encodes the three risk tiers from §3 of the protocol:
-
-| Tier | Protocol |
+| Path | Steps (triggering role) |
 |---|---|
-| `T1` | Gate 2 only; no ChatGPT spec or review; CSS/template/static changes only |
-| `T2` | Full protocol — both gates, ChatGPT spec, ChatGPT review |
-| `T3` | Full protocol + Human independently re-runs ≥1 verification command at Gate 2 |
+| T1 | DRAFT → IN_IMPLEMENTATION (H) → AWAITING_GATE_2 (C, evidence + Relay) → SHIPPED (H, evidence) → CLOSED (H) |
+| T2/T3 | DRAFT → SPECCING (H) → AWAITING_GATE_1 (G, evidence) → IN_IMPLEMENTATION (H, Gate 1) → UNDER_REVIEW (C, evidence + Relay) → AWAITING_GATE_2 (G, evidence) → SHIPPED (H, evidence; **T3: recorded human re-run**) → CLOSED (H) |
+| Loops and exits | AWAITING_GATE_1 → DRAFT (H, reason) · IN_IMPLEMENTATION → BLOCKED_BY_DISCOVERY (C/H, evidence) · BLOCKED_BY_DISCOVERY → IN_IMPLEMENTATION (H, reason + evidence) · BLOCKED_BY_DISCOVERY → CLOSED (H, reason) · UNDER_REVIEW → REVISION_NEEDED (G, evidence) · REVISION_NEEDED → IN_IMPLEMENTATION (C) · REVISION_NEEDED → CLOSED (§12.4 INCOMPLETE; H, reason) · AWAITING_GATE_2 → REVISION_NEEDED (H/C, evidence) |
+| Return to Gate 1 | IN_IMPLEMENTATION → AWAITING_GATE_1 (§7.2 resource conflict; H, reason) · BLOCKED_BY_DISCOVERY → AWAITING_GATE_1 (§10.3 significant amendment; H, reason). T2/T3 only |
+
+Role key: H = Human, G = ChatGPT, C = Claude.
+
+The ledger records the **author** of each step. ChatGPT's spec and review steps should be recorded with a ChatGPT actor name, such as `chatgpt`. Do not use the operator's own name: under §2 the Human pastes ChatGPT's text, but the step is still ChatGPT's.
+
+**Tier escalation:** `escalate_tier` moves a T2 task to T3 (§3, §10.3, §14).
+- It is a Human decision and needs a reason.
+- It is allowed only while the task is in `AWAITING_GATE_1`.
+- It is one-way: T3 controls can never be shed.
 
 ---
 
-## `A2ATask`
-
-Minimal dataclass representing one protocol task. Fields:
-
-| Field | Type | Default |
-|---|---|---|
-| `task_id` | `str` | — required |
-| `title` | `str` | — required |
-| `tier` | `A2ATaskTier` | — required |
-| `github_issue_url` | `str` | — required |
-| `state` | `A2AProtocolState` | `DRAFT` |
-| `created_at` | `datetime` | UTC now |
-| `updated_at` | `datetime` | UTC now |
-| `protocol_version` | `str` | `"0.2"` |
-
-Generate a unique task ID:
+## `A2AStateManager`: the ledger
 
 ```python
-from a2a.models import A2ATask
-task_id = A2ATask.new_id()  # "A2A-3F9D2C1A" (prefix + 8 uppercase hex chars)
+from a2a.models import A2ATask, A2ATaskTier, A2AProtocolState as S
+from a2a.protocol import A2ARole
+from a2a.state import A2AStateManager, A2AAttestation, relay_status_from_db
+
+sm = A2AStateManager("a2a.db", relay_status_lookup=relay_status_from_db("relay.db"))
+
+task = A2ATask(task_id=A2ATask.new_id(), title="Fix OG tags", tier=A2ATaskTier.T2,
+               github_issue_url="https://github.com/org/repo/issues/7")
+sm.create_task(task, created_by="craig")          # validated here: DRAFT only, title, URL
+
+sm.transition_state(task.task_id, S.SPECCING, A2AAttestation(actor="craig", role=A2ARole.HUMAN))
+sm.transition_state(task.task_id, S.AWAITING_GATE_1, A2AAttestation(
+    actor="chatgpt", role=A2ARole.CHATGPT,
+    evidence_ref="https://github.com/org/repo/issues/7#issuecomment-1"))
+
+sm.get_history(task.task_id)           # list[A2ATransitionRecord], creation first
+sm.record_human_verification(tid, actor, command, output)   # T3, at Gate 2
+sm.get_human_verifications(tid)
+sm.check_consistency()                 # list[str] of problems; [] when consistent
 ```
 
----
+### What `transition_state` checks
 
-## `A2AStateManager`
+All checks run inside **one `BEGIN IMMEDIATE` transaction** with the write, so no caller can skip a check and no concurrent writer can slip in between. This closes the audit's D3 (the state layer bypassed tier rules) and D4 (the tier check ran outside the CAS). The checks run in this order:
 
-SQLite-backed persistence for `A2ATask`. Located in `a2a/state.py`.
+1. The task exists.
+2. The step is in the graph.
+3. The tier may take it.
+4. The attested **role** may trigger it.
+5. The **actor** has not acted in a different role on this task (no self-review or self-approval). Actor names are compared in canonical form (NFKC, invisible characters removed, whitespace collapsed, case-folded), so `Claude` and ` claude ` are the same actor.
+   - After normalisation a name must be **plain**: ASCII letters and digits, joined by single `.`, `_`, `@`, `-` or space, at most 64 characters.
+   - Control characters, combining marks, fillers and look-alike letters from other scripts are refused rather than silently normalised.
+   - The binding covers creation, transitions, human re-runs and tier changes.
+   - The placeholders `unattributed` and `legacy-import` are reserved and never bind a role.
+6. A required **reason** or **evidence reference** is present.
+7. A cited **Relay task** is found and is `COMPLETED`. It must never have been cited before, by any task, including this one. A revision therefore needs its own verified Relay run. A Relay task cited on a step that does not take one is refused.
+8. For a **T3** task entering SHIPPED, a human re-run was recorded in the current Gate 2 window.
 
-```python
-from a2a.state import A2AStateManager, A2AInvalidTransitionError
-from a2a.models import A2ATask, A2ATaskTier, A2AProtocolState
+Any failure raises `A2AInvalidTransitionError`, and nothing is written. On success the state is updated with a CAS guard and the step is appended to `a2a_transitions`.
 
-sm = A2AStateManager("path/to/a2a.db")
+### Relay evidence (D1)
 
-# Create
-task = A2ATask(task_id=A2ATask.new_id(), title="...", tier=A2ATaskTier.T2,
-               github_issue_url="https://github.com/org/repo/issues/1")
-sm.create_task(task)
+`relay_status_from_db(path)` opens the Relay database in SQLite **read-only URI mode** for each lookup, and Relay data is never changed. SQLite may still create its usual `-wal` and `-shm` side files beside a WAL-mode database.
 
-# Read
-task = sm.get_task(task.task_id)   # returns A2ATask | None
-tasks = sm.list_tasks()            # returns list[A2ATask] ordered by created_at
+A missing, unreadable or locked Relay database is reported as such (`A2ARelayUnavailableError`), never as "task not found". The lookup runs **before** the A2A write transaction, so a slow Relay database never holds the A2A write lock.
 
-# State transition — enforces ALLOWED_A2A_TRANSITIONS, raises on violation
-try:
-    updated = sm.transition_state(task.task_id, A2AProtocolState.SPECCING)
-except A2AInvalidTransitionError as e:
-    ...  # invalid transition, or task not found, or concurrent modification
-```
+If no lookup is configured, steps that require Relay evidence fail closed.
 
-**Schema:** one table, `a2a_tasks`, with columns matching `A2ATask` fields. WAL mode
-enabled. `task_id` is the PRIMARY KEY.
+Only `COMPLETED` counts as evidence. `ACCEPTANCE_REQUIRED` does not: its UNVERIFIED acceptance criteria have not yet been acknowledged by a human.
 
-**CAS guard:** `transition_state` uses `UPDATE ... WHERE task_id=? AND state=<current>`.
-If `rowcount == 0` after a valid-looking transition, a concurrent writer changed the state
-first — this is raised as `A2AInvalidTransitionError` rather than silently overwriting.
+### T3 human re-run (D4, protocol §9.7)
 
-**Thread safety:** each thread gets its own `sqlite3.Connection` via `threading.local`.
+`record_human_verification` is allowed only for T3 tasks in `AWAITING_GATE_2`, and only by an actor who has not acted on the task as ChatGPT or Claude.
+
+Each record is bound to the task's latest entry into Gate 2. If the task goes back through REVISION_NEEDED, a fresh re-run is required before it can ship.
+
+The record is the human's attestation. Software cannot prove the command was actually run.
+
+### Schema
+
+| Table | Purpose |
+|---|---|
+| `a2a_tasks` | Current state. A trigger allows only a T2 → T3 tier change. |
+| `a2a_transitions` | Append-only history: `seq`, `from_state` (NULL for creation), `to_state`, `actor`, `role`, `reason`, `evidence_ref`, `relay_task_id`, `timestamp`. Triggers reject UPDATE and DELETE. |
+| `a2a_human_verifications` | T3 re-runs: `actor`, `command`, `output` (verbatim, line endings preserved), `gate2_entry_seq`, `recorded_at`. Append-only. |
+| `a2a_tier_changes` | Tier escalations: `from_tier`, `to_tier`, `actor`, `reason`, `evidence_ref`, `after_seq`. Append-only. |
+
+The creation row records the task's tier, and `check` replays the tier from it.
+
+**One-time migration:** the database's `PRAGMA user_version` records the schema version.
+- When a database created before the ledger is first opened, each existing task gets one `legacy-import` creation row with its state and tier at that moment.
+- This happens **once**, and only when the ledger table did not exist before.
+- After that, any task with no history can only have been inserted outside the ledger, and `check` reports it.
+
+`check_consistency()` replays every task's history against `RULES` and reports:
+- history steps that do not chain;
+- steps outside the graph or off the task's tier path at that point;
+- a step taken by a role the rule does not allow;
+- a missing reason, evidence reference or Relay citation;
+- an actor holding two roles;
+- a T3 task SHIPPED without a re-run in its Gate 2 window;
+- a Relay task cited twice;
+- a stored state or tier that disagrees with the history;
+- a task with no history;
+- rows that cannot be parsed.
+
+This catches raw-SQL edits and rows forged by insertion.
 
 ---
 
 ## `A2AService`
 
-The controlled entry point for task lifecycle operations. Located in `a2a/service.py`.
-Never accesses SQLite directly — delegates all persistence to `A2AStateManager`.
+`A2AService` wraps the state manager with domain errors and generated IDs. It never accesses SQLite directly.
 
-```python
-from a2a.state import A2AStateManager
-from a2a.service import A2AService, A2AInvalidTaskError, A2ATaskNotFoundError, A2ATransitionError
-from a2a.models import A2ATaskTier, A2AProtocolState
-
-sm  = A2AStateManager("path/to/a2a.db")
-svc = A2AService(sm)
-
-# Create — task_id generated automatically, initial state is DRAFT
-# github_issue_url must be a valid GitHub Issue URL:
-#   https://github.com/<owner>/<repo>/issues/<positive-integer>
-# Raises A2AInvalidTaskError on any other value (validated at the service boundary).
-try:
-    task = svc.create_task(
-        title="Fix OG description on brand pages",
-        tier=A2ATaskTier.T2,
-        github_issue_url="https://github.com/org/repo/issues/7",
-    )
-except A2AInvalidTaskError as e:
-    print(e.reason)   # human-readable explanation
-
-# Advance — enforces ALLOWED_A2A_TRANSITIONS via A2AStateManager
-try:
-    updated = svc.advance(task.task_id, A2AProtocolState.SPECCING)
-except A2ATaskNotFoundError as e:
-    print(e.task_id)        # task_id attribute
-except A2ATransitionError as e:
-    print(e.from_state)     # A2AProtocolState
-    print(e.to_state)       # A2AProtocolState
-    print(e.reason)         # str — from the state layer
-
-# Retrieve
-task = svc.get_task(task.task_id)   # raises A2ATaskNotFoundError if missing
-
-# List
-tasks = svc.list_tasks()            # list[A2ATask] ordered by created_at
-```
-
-**Title constraint:** `create_task` rejects any `title` that is empty or whitespace-only
-(empty string, spaces, tabs, newlines). Raises `A2AInvalidTaskError` before any persistence
-occurs.
-
-**GitHub Issue URL constraint:** `create_task` validates `github_issue_url` before persisting.
-The URL must match `https://github.com/<owner>/<repo>/issues/<N>` where `N` is a positive
-integer (≥ 1). Rejected inputs include empty strings, non-URLs, non-GitHub hosts, GitHub
-PR URLs, `/issues/0`, non-numeric issue numbers, and extra path segments. No network
-request is made — validation is local and deterministic.
-
-**Error types:**
-
-| Exception | When raised | Key attributes |
-|---|---|---|
-| `A2AInvalidTaskError` | `create_task` with empty/whitespace title or invalid `github_issue_url` | `.reason` |
-| `A2ATaskNotFoundError` | `get_task` or `advance` on unknown `task_id` | `.task_id` |
-| `A2ATransitionError` | `advance` with forbidden target state | `.task_id`, `.from_state`, `.to_state`, `.reason` |
-
----
-
-## Tests
-
-`tests/test_a2a_models.py` covers:
-- Enum completeness (all 10 states, all 3 tiers)
-- Transition map completeness (every state has an entry)
-- T1 and T2/T3 happy-path transitions
-- BLOCKED_BY_DISCOVERY interruption on any tier
-- CLOSED as terminal (no outgoing transitions)
-- Invalid transitions (fail-closed parametrised table)
-- Self-transitions invalid for every state
-- Full reachability from DRAFT
-
-Run with: `pytest tests/test_a2a_models.py -v`
-
-`tests/test_a2a_state.py` covers:
-- Creation and full field round-trip
-- Retrieval (`get_task`, `list_tasks`, ordering)
-- Duplicate create raises `sqlite3.IntegrityError`
-- T1 and T2/T3 happy-path transition sequences
-- BLOCKED_BY_DISCOVERY interruption on both tiers
-- Invalid transitions: validation failure and no state corruption
-- Terminal CLOSED rejects all targets
-- Non-existent task raises `A2AInvalidTransitionError`
-- Return value, `updated_at` advancement, immutable field preservation
-- Persistence across separate `A2AStateManager` instances (new DB connections)
-- Concurrent transition: threading test confirms exactly one winner
-
-Run with: `pytest tests/test_a2a_state.py -v`
-
-`tests/test_a2a_service.py` covers:
-- **GitHub Issue URL validation (A2A-19):** valid URL accepted; 12 parametrised invalid URLs
-  rejected (empty, garbage, non-github, http, PR URL, no issue number, trailing slash,
-  /issues/0, negative, non-numeric, extra path, leading zero); `.reason` attribute populated;
-  no task persisted on invalid URL
-- **Task title validation (A2A-20):** 5 parametrised blank titles rejected (empty string,
-  spaces, tab, newline, mixed whitespace); `.reason` populated; no task persisted on blank title;
-  valid title accepted
-- Creation: fields, tier acceptance, unique ID generation, DRAFT initial state
-- Retrieval: correct task returned, `A2ATaskNotFoundError` with `task_id` attribute
-- Listing: empty, multiple tasks, creation-order ordering
-- Valid transitions: T1/T2 happy paths, BLOCKED_BY_DISCOVERY roundtrip, Gate 1 rejection
-- Invalid transitions: `A2ATransitionError` with `from_state`/`to_state`/`reason`, CLOSED terminal
-- Missing task in `advance`: `A2ATaskNotFoundError`
-- State corruption: state unchanged after invalid transition attempt
-- Persistence via state manager: data created/advanced by service is visible directly
-  via `A2AStateManager`, and across separate service instances
-- **Tier-aware enforcement (A2A-18):** T1 tasks blocked from SPECCING/AWAITING_GATE_1/UNDER_REVIEW;
-  T2/T3 tasks blocked from DRAFT → IN_IMPLEMENTATION shortcut; error attributes and reason strings
-  verified; valid re-entry paths (AWAITING_GATE_1/REVISION_NEEDED/BLOCKED_BY_DISCOVERY → IN_IMPLEMENTATION)
-  confirmed unaffected; T1 and T2 full happy paths confirmed unaffected
-- **T2/T3 UNDER_REVIEW gate (F-1 fix):** T2 and T3 tasks blocked from IN_IMPLEMENTATION →
-  AWAITING_GATE_2 shortcut; T2/T3 valid path through UNDER_REVIEW confirmed; T1 shortcut
-  IN_IMPLEMENTATION → AWAITING_GATE_2 confirmed unaffected; state not corrupted on rejection
-
-Run with: `pytest tests/test_a2a_service.py -v`
-
-`tests/test_a2a_cli.py` covers:
-- `create-task`: prints task_id/DRAFT/title/tier/issue_url, persists to DB, all three tiers, DB configurable
-- **Invalid Issue URL (A2A-19):** bad URL, non-github URL, PR URL, `/issues/0` → exit 1 + stderr + no stdout + no task persisted
-- **Invalid title (A2A-20):** empty title, whitespace title, tab title → exit 1 + stderr + no stdout + no task persisted
-- `get-task`: prints task_id/state/issue_url; missing → exit 1 + stderr message containing task_id + no stdout
-- `list-tasks`: "No tasks." on empty, single/multiple task display, shows task_ids, exit 0 on empty
-- `advance`: prints new state + task_id, updates DB, T1 path, full T2 path; invalid transition → exit 1 + stderr + no stdout + state unchanged; missing task → exit 1 + stderr
-- **Tier-violation paths via CLI (A2A-18 gap, closed A2A-19):** T1→SPECCING, T1→AWAITING_GATE_1, T1→UNDER_REVIEW, T2 DRAFT→IN_IMPLEMENTATION → all exit 1 + stderr, no stdout, state unchanged
-- **T2/T3 UNDER_REVIEW gate via CLI (F-1 fix):** T2 and T3 IN_IMPLEMENTATION → AWAITING_GATE_2
-  shortcut → exit 1, stderr contains Error, no stdout, state unchanged
-- Parser structure: subcommand required, `--title`/`--tier`/`--issue-url` required on create-task, `--to` required on advance, `--db` defaults to `"a2a.db"`, `--db` override works
-
-Run with: `pytest tests/test_a2a_cli.py -v`
+| Method | Raises |
+|---|---|
+| `create_task(title, tier, github_issue_url, created_by=None)` | `A2AInvalidTaskError(.reason)` |
+| `advance(task_id, new_state, attestation)` | `A2ATaskNotFoundError(.task_id)`; `A2ATransitionError(.task_id, .from_state, .to_state, .reason)` |
+| `record_human_verification(task_id, actor, command, output)` | `A2ATaskNotFoundError`, `A2ATransitionError` |
+| `escalate_tier(task_id, actor, reason, evidence_ref=None)` | `A2ATaskNotFoundError`, `A2ATransitionError` |
+| `get_task`, `list_tasks`, `history`, `human_verifications`, `check_consistency` | `A2ATaskNotFoundError` where relevant |
 
 ---
 
 ## CLI
 
-Entry point registered in `pyproject.toml` as `a2a = "a2a.cli:main"`. After `pip install -e .`:
-
 ```bash
-a2a --help
-a2a create-task --title "Fix OG tags" --tier T2 --issue-url https://github.com/org/repo/issues/7
+a2a --db a2a.db --relay-db relay.db <command> ...
+
+a2a create-task --title "Fix OG tags" --tier T2 \
+    --issue-url https://github.com/org/repo/issues/7 --actor craig
+a2a advance A2A-XXXXXXXX --to SPECCING --actor craig --role HUMAN
+a2a advance A2A-XXXXXXXX --to AWAITING_GATE_1 --actor chatgpt --role CHATGPT --evidence <url>
+a2a advance A2A-XXXXXXXX --to UNDER_REVIEW --actor claude --role CLAUDE \
+    --evidence <pr-url> --relay-task TASK-XXXXXXXX
+a2a record-human-verification A2A-XXXXXXXX --actor craig --command "pytest -q" --output-file out.txt
+a2a escalate-tier A2A-XXXXXXXX --actor craig --reason "new EXCLUSIVE resource: crontab"
+a2a get-task A2A-XXXXXXXX        # includes the full attested history
 a2a list-tasks
-a2a get-task A2A-3F9D2C1A
-a2a advance A2A-3F9D2C1A --to SPECCING
+a2a check                        # exit 1 if any task's state disagrees with its history
 ```
 
-All commands accept `--db PATH` to specify a non-default SQLite file. Errors print to stderr and exit with code 1; success prints to stdout and exits 0.
-
-**Commands:**
-
-| Command | Required args | Action |
-|---|---|---|
-| `create-task` | `--title`, `--tier` (T1/T2/T3), `--issue-url` | Creates task in DRAFT; prints task_id + detail |
-| `get-task` | `TASK_ID` (positional) | Prints task detail; exit 1 if not found |
-| `list-tasks` | — | Lists all tasks ordered by creation time; "No tasks." if empty |
-| `advance` | `TASK_ID` (positional), `--to STATE` | Advances state; exit 1 on invalid transition or missing task |
+Errors, including database problems, are printed to stderr without a traceback and exit with code 1. The message says that no state was changed. `--relay-db` defaults to `relay.db`.
 
 ---
 
 ## Relationship to `relay/`
 
-The `a2a/` package is independent of `relay/`. They share the same repository but have
-separate concerns:
+- **Relay** owns execution state (`relay.db`).
+- **A2A** owns protocol state (`a2a.db`).
 
-- `relay/` — Relay prototype: safe AI-to-AI subprocess execution (P0/P1 series)
-- `a2a/` — A2A protocol: governance layer for Human→ChatGPT→Claude→GitHub collaboration
+They are linked by reference only. An implementation step in A2A cites a Relay task ID, and A2A reads that task's status read-only. Relay does not import A2A. Neither package's state enum depends on the other.
 
-The state enums do not overlap. `relay/models.py:TaskStatus` governs Relay's internal
-execution lifecycle; `a2a/models.py:A2AProtocolState` governs the A2A collaboration
-protocol. Neither imports from the other.
+---
+
+## Tests
+
+| File | Covers |
+|---|---|
+| `tests/test_a2a_models.py` | Enums, graph completeness and reachability, valid and invalid edges |
+| `tests/test_a2a_state.py` | Persistence, CAS, graph and tier enforcement at the state layer |
+| `tests/test_a2a_service.py` | Service API, domain errors, tier paths |
+| `tests/test_a2a_cli.py` | CLI commands and exit codes |
+| `tests/test_a2a_ledger.py` | Batch 4 and its review findings: role authority, canonical actor binding, evidence and reasons, append-only tables, tier escalation, legacy import, `check` replay (including forged rows), the Relay evidence link against a real read-only Relay DB (missing/unreadable/re-cited), T3 re-run windows, and the CLI end to end |
+
+Most of the older tests walk the protocol through `tests/a2a_support.py`. For each step, it attests the role the protocol prescribes, cites evidence, cites a Relay task where one is required, and records the T3 re-run. Tests that exercise authority or evidence build their own `A2AAttestation` instead.

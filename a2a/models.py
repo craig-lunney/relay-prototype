@@ -30,6 +30,8 @@ class A2AProtocolState(str, Enum):
 # T2/T3 path: DRAFT → SPECCING → AWAITING_GATE_1 → IN_IMPLEMENTATION
 #             → UNDER_REVIEW → AWAITING_GATE_2 → SHIPPED → CLOSED
 # BLOCKED_BY_DISCOVERY interrupts IN_IMPLEMENTATION on any tier.
+# Who may take each step, per tier, and what must be attested with it is in
+# a2a/protocol.py (RULES); A2AStateManager enforces both.
 ALLOWED_A2A_TRANSITIONS: dict[A2AProtocolState, frozenset[A2AProtocolState]] = {
     A2AProtocolState.DRAFT: frozenset({
         A2AProtocolState.SPECCING,           # T2/T3: Human submits Brief to ChatGPT
@@ -46,10 +48,12 @@ ALLOWED_A2A_TRANSITIONS: dict[A2AProtocolState, frozenset[A2AProtocolState]] = {
         A2AProtocolState.BLOCKED_BY_DISCOVERY,  # Discovery found during implementation
         A2AProtocolState.UNDER_REVIEW,           # T2/T3: Claude opens PR + posts evidence
         A2AProtocolState.AWAITING_GATE_2,        # T1: Claude opens PR + posts evidence
+        A2AProtocolState.AWAITING_GATE_1,        # §7.2: post-Gate-1 resource conflict
     }),
     A2AProtocolState.BLOCKED_BY_DISCOVERY: frozenset({
         A2AProtocolState.IN_IMPLEMENTATION,  # Human resolves discovery on Issue
         A2AProtocolState.CLOSED,             # Task abandoned after discovery
+        A2AProtocolState.AWAITING_GATE_1,    # §10.3: significant amendment, Gate 1 again
     }),
     A2AProtocolState.UNDER_REVIEW: frozenset({
         A2AProtocolState.REVISION_NEEDED,    # ChatGPT review: BLOCKED
@@ -57,6 +61,7 @@ ALLOWED_A2A_TRANSITIONS: dict[A2AProtocolState, frozenset[A2AProtocolState]] = {
     }),
     A2AProtocolState.REVISION_NEEDED: frozenset({
         A2AProtocolState.IN_IMPLEMENTATION,  # Claude revises + re-posts evidence
+        A2AProtocolState.CLOSED,             # §12.4: Human closes as INCOMPLETE
     }),
     A2AProtocolState.AWAITING_GATE_2: frozenset({
         A2AProtocolState.SHIPPED,            # Human merges + post-deploy AC passes
