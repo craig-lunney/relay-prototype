@@ -34,7 +34,7 @@ from typing import Callable
 from urllib.parse import parse_qs
 
 from .dashboard import render, snapshot
-from .jobs import DEFAULT_CONFIG, DEFAULT_INTRAY, JOBS, uk_time
+from .jobs import DEFAULT_CONFIG, DEFAULT_INTRAY, JOBS, retired_jobs, uk_time
 
 ROOT = Path(__file__).resolve().parent.parent
 # The buttons each job gets: (label, live). A live-only job has no offline button,
@@ -129,7 +129,10 @@ def controls_html(state: OfficeState) -> str:
                      f'· started {_e(state.started_at)} · this page refreshes by itself.</p>')
     parts.append('<div class="jobs">')
     disabled = " disabled" if busy else ""
+    retired = retired_jobs(state.config)  # read each time: edits apply on the next refresh
     for name, spec in JOBS.items():
+        if name in retired:
+            continue
         buttons = [(label, live, ' class="live"' if live else "")
                    for label, live in BUTTONS.get(name, [])]
         forms = "".join(
@@ -187,7 +190,8 @@ class OfficeHandler(BaseHTTPRequestHandler):
         if self.path != "/":
             return self._message(404, "Nothing here.")
         s = self.state
-        page = render(snapshot(s.relay_db, s.a2a_db, s.intray), s.relay_db, s.a2a_db,
+        page = render(snapshot(s.relay_db, s.a2a_db, s.intray, retired_jobs(s.config)),
+                      s.relay_db, s.a2a_db,
                       controls=controls_html(s), refresh_seconds=5 if s.running else None,
                       subtitle="Live office")
         self._send(200, page)
@@ -216,6 +220,8 @@ class OfficeHandler(BaseHTTPRequestHandler):
         live = (form.get("live") or [""])[0] == "1"
         if job not in JOBS:
             return self._message(400, "Unknown job.")
+        if job in retired_jobs(self.state.config):
+            return self._message(400, "That job is retired.")
         if (job and (live not in {is_live for _, is_live in BUTTONS.get(job, [])})):
             return self._message(400, "That job has no " + ("live" if live else "offline") + " mode.")
         if not self.state.start_job(job, live):

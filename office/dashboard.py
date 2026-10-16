@@ -30,7 +30,7 @@ from pathlib import Path
 
 from relay.state import GENESIS_HASH, event_hash
 
-from .jobs import DEFAULT_INTRAY, JOBS, uk_time
+from .jobs import DEFAULT_CONFIG, DEFAULT_INTRAY, JOBS, retired_jobs, uk_time
 
 # Statuses that need the boss, with the command that resolves them.
 _RELAY_WAITING = {
@@ -199,9 +199,11 @@ def load_a2a(path: Path, snap: Snapshot) -> None:
                                   "task": s["task_id"]})
 
 
-def load_intray(folder: Path, snap: Snapshot) -> None:
+def load_intray(folder: Path, snap: Snapshot, retired: frozenset[str] = frozenset()) -> None:
     """Latest result of each in-tray job (files written by office.jobs)."""
     for name in JOBS:
+        if name in retired:
+            continue
         try:
             data = json.loads((Path(folder) / f"{name}.json").read_text(encoding="utf-8"))
         except (OSError, ValueError):
@@ -217,12 +219,13 @@ def load_intray(folder: Path, snap: Snapshot) -> None:
         })
 
 
-def snapshot(relay_db: Path, a2a_db: Path, intray: Path | None = None) -> Snapshot:
+def snapshot(relay_db: Path, a2a_db: Path, intray: Path | None = None,
+             retired: frozenset[str] = frozenset()) -> Snapshot:
     snap = Snapshot()
     load_relay(relay_db, snap)
     load_a2a(a2a_db, snap)
     if intray is not None:
-        load_intray(intray, snap)
+        load_intray(intray, snap, retired)
     snap.activity.sort(key=lambda a: a["when"], reverse=True)
     snap.activity = snap.activity[:20]
     return snap
@@ -409,8 +412,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--a2a-db", type=Path, default=Path("a2a.db"))
     parser.add_argument("--out", type=Path, default=Path("office.html"))
     parser.add_argument("--intray", type=Path, default=DEFAULT_INTRAY)
+    parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     args = parser.parse_args(argv)
-    snap = snapshot(args.relay_db, args.a2a_db, args.intray)
+    snap = snapshot(args.relay_db, args.a2a_db, args.intray, retired_jobs(args.config))
     args.out.write_text(render(snap, args.relay_db, args.a2a_db), encoding="utf-8")
     print(f"Wrote {args.out} - waiting on you: {len(snap.waiting)}")
     return 0

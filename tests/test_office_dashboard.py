@@ -144,3 +144,13 @@ def test_odd_verification_details_do_not_crash(tmp_path):
     task = snap.relay_tasks[0]
     assert (task["changed"], task["violations"], task["unverified"]) == ([], [], [])
     render(snap, relay_db, tmp_path / "a2a.db")
+
+
+def test_static_page_hides_retired_jobs(tmp_path):
+    from office.jobs import save_result, JobResult
+    intray = tmp_path / "intray"
+    for name in ("category-images", "crontab-guard"):
+        save_result(intray, JobResult(job=name, title=name, desk="d", level="REPORT",
+                                      status="OK", summary="s"))
+    snap = snapshot(tmp_path / "r.db", tmp_path / "a.db", intray, frozenset({"category-images"}))
+    assert [j["job"] for j in snap.intray] == ["crontab-guard"]

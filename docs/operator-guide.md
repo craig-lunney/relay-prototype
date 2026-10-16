@@ -243,6 +243,11 @@ repository:
 }
 ```
 
+To retire a job you no longer want, add `"retired_jobs": ["category-images"]` (job
+names from `python -m office.jobs list`) to the same file: it disappears from the
+office buttons, the in-tray and the morning briefing, and can still be run by name.
+Remove the name to bring it back.
+
 `ssh_options` may only set algorithm, key and known-hosts options; anything that
 could run a command (such as `ProxyCommand`) is refused. Without a config file the
 job reports "Not configured" and does nothing.

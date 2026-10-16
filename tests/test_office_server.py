@@ -205,3 +205,14 @@ def test_job_argv_uses_this_interpreter(tmp_path):
 def test_app_footer_is_not_the_snapshot_footer(office):
     _, page = request(office, "GET", "/")
     assert "The office app" in page and "This page is a snapshot" not in page
+
+
+def test_retired_job_is_hidden_and_refused(office):
+    (office["tmp"] / "c.json").write_text('{"retired_jobs": ["category-images"]}', encoding="utf-8")
+    from office.jobs import save_result, JobResult
+    save_result(office["state"].intray, JobResult(job="category-images", title="Category images backfill (CCP 3)",
+                                                  desk="d", level="CHANGE", status="OK", summary="closed"))
+    _, page = request(office, "GET", "/")
+    assert "Category images backfill" not in page
+    assert run(office, "category-images", live=True)[0].status == 400
+    assert office["calls"] == []

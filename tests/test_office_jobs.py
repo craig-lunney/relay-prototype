@@ -709,3 +709,29 @@ def test_uk_time(value, expected):
     if jobs.UK_TZ is None:
         pytest.skip("no time-zone data on this machine")
     assert jobs.uk_time(value) == expected
+
+
+@pytest.mark.parametrize("content,expected", [
+    ('{"retired_jobs": ["category-images", "nope", 3]}', {"category-images"}),
+    ('{"retired_jobs": "category-images"}', set()),
+    ("[]", set()),
+    ("{broken", set()),
+])
+def test_retired_jobs_reads_only_known_names(tmp_path, content, expected):
+    path = tmp_path / "c.json"
+    path.write_text(content, encoding="utf-8")
+    assert jobs.retired_jobs(path) == expected
+    assert jobs.retired_jobs(tmp_path / "missing.json") == frozenset()
+
+
+def test_briefing_and_list_skip_retired_jobs(tmp_path, capsys):
+    config = tmp_path / "c.json"
+    config.write_text('{"retired_jobs": ["category-images"]}', encoding="utf-8")
+    _, result, _ = _run(tmp_path, "run", "morning-briefing", "--relay-db", str(tmp_path / "r.db"),
+                        "--a2a-db", str(tmp_path / "a.db"), config=config)
+    assert not any("Category images" in f for f in result["findings"])
+    assert any("Crontab guard" in f for f in result["findings"])
+    capsys.readouterr()
+    jobs.main(["--config", str(config), "list"])
+    out = capsys.readouterr().out
+    assert "category-images    (retired)" in out and "crontab-guard" in out

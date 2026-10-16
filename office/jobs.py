@@ -141,6 +141,22 @@ class ConfigError(ValueError):
     """The crontab-guard section of the local config is missing or invalid."""
 
 
+def retired_jobs(path: Path) -> frozenset[str]:
+    """Jobs the boss has retired (config "retired_jobs": [...]); unknown names are ignored.
+
+    Retired jobs are hidden from the office buttons, the in-tray and the morning
+    briefing. They can still be run by name from the command line.
+    """
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return frozenset()
+    names = data.get("retired_jobs") if isinstance(data, dict) else None
+    if not isinstance(names, list):
+        return frozenset()
+    return frozenset(n for n in names if isinstance(n, str) and n in JOBS)
+
+
 def load_guard_config(path: Path) -> dict:
     """Read and validate the crontab_guard section of the local config file."""
     try:
@@ -680,8 +696,9 @@ def job_morning_briefing(args) -> JobResult:
         findings += [f"  - {w['what']}: {w['id']}" for w in snap.waiting[:8]]
     except Exception as exc:  # the briefing must still be produced
         findings.append(f"Office databases not readable: {exc}")
+    retired = retired_jobs(Path(args.config))
     for name in JOBS:
-        if name == "morning-briefing":
+        if name == "morning-briefing" or name in retired:
             continue
         result = load_result(intray, name)
         if result is None:
@@ -776,7 +793,11 @@ def main(argv: list[str] | None = None) -> int:
         except (AttributeError, ValueError):
             pass
     if args.command == "list":
+        retired = retired_jobs(Path(args.config))
         for spec in JOBS.values():
+            if spec.name in retired:
+                print(f"{spec.name:18} (retired)")
+                continue
             live = " (live read needs --live)" if spec.live_needed else ""
             print(f"{spec.name:18} {spec.level:7} {spec.desk}: {spec.blurb}{live}")
         return 0
