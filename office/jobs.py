@@ -34,6 +34,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+import urllib.parse
 import xml.etree.ElementTree as ET
 from html.parser import HTMLParser
 from urllib.parse import urlsplit
@@ -117,6 +118,11 @@ JOBS: dict[str, JobSpec] = {
         "backup-check", "Backup check", "The Inspector", "REPORT", True,
         "Checks how old the newest full database copy on the server is, and that it is not "
         "unexpectedly small."),
+    "product-copy": JobSpec(
+        "product-copy", "Product copy check", "The Architect", "REPORT", True,
+        "Reads every enabled product (read-only) and flags names with repeated words, meta "
+        "descriptions that contradict the product (upright vs cylinder, cordless vs corded...), "
+        "promises to double-check (free delivery, next day...) and missing or long descriptions."),
     "share-preview": JobSpec(
         "share-preview", "Share preview", "The Designer", "REPORT", True,
         "Shows how a loshop.co.uk link will look when shared on Facebook or WhatsApp, and "
@@ -725,6 +731,185 @@ def job_category_images(args) -> JobResult:
                    "approval for the live changes." if missing else ""))
 
 
+# ── product copy check ────────────────────────────────────────────────────────
+
+# Words that describe the same thing in different ways: a meta description that uses one
+# word of a group while the product's own name/text uses a different one is a contradiction.
+TYPE_GROUPS = {
+    "vacuum type": {"upright": "upright", "cylinder": "cylinder", "canister": "cylinder",
+                    "cordless": "cordless", "stick": "cordless", "robot": "robot",
+                    "handheld": "handheld"},
+    "power": {"cordless": "cordless", "corded": "corded"},
+    "installation": {"freestanding": "freestanding", "free-standing": "freestanding",
+                     "integrated": "built-in", "built-in": "built-in", "built in": "built-in"},
+}
+PROMISES = ["free delivery", "free installation", "free fitting", "next day", "next-day",
+            "same day", "price match", "lowest price", "best price", "cheapest", "guaranteed"]
+_TAGS = re.compile(r"<[^>]+>")
+
+
+def _words(text: str) -> list[str]:
+    return re.findall(r"[a-z0-9]+", text.lower())
+
+
+def repeated_phrase(name: str) -> str | None:
+    """A run of two or more words that appears twice in the name, e.g. 'dyson big ball'."""
+    words = _words(name)
+    for n in range(min(5, len(words) // 2), 1, -1):
+        seen = set()
+        for i in range(len(words) - n + 1):
+            gram = tuple(words[i:i + n])
+            if gram in seen and not all(w.isdigit() for w in gram):
+                return " ".join(gram)
+            seen.add(gram)
+    return None
+
+
+def _terms(text: str, group: dict) -> set[str]:
+    low = " " + " ".join(text.lower().split()) + " "
+    return {canon for word, canon in group.items()
+            if re.search(r"(?<![a-z])" + re.escape(word) + r"(?![a-z-])", low)}
+
+
+def _is_euronics(product: dict) -> bool:
+    """Local Euronics items are the only products without free delivery (Craig, 2026-10-16)."""
+    return str(product.get("is_euronics") or "").strip().lower() in ("1", "true", "yes")
+
+
+def check_product_copy(product: dict) -> list[tuple[str, str]]:
+    """[(issue, detail)] for one product: name, meta_title, meta_description, description."""
+    issues = []
+    name = product.get("name") or ""
+    meta = (product.get("meta_description") or "").strip()
+    own = name + " " + _TAGS.sub(" ", (product.get("description") or "") + " "
+                                  + (product.get("short_description") or ""))
+    phrase = repeated_phrase(name)
+    if phrase:
+        issues.append(("name repeats words", f"'{phrase}' appears twice"))
+    if not meta:
+        issues.append(("no meta description", "Google and shares fall back to other text"))
+    else:
+        if len(meta) > 160:
+            issues.append(("meta description long", f"{len(meta)} characters (about 155 shows)"))
+        for label, group in TYPE_GROUPS.items():
+            said, actual = _terms(meta, group), _terms(own, group)
+            if said and actual and not said & actual:
+                issues.append((f"{label} contradiction",
+                               f"meta says {', '.join(sorted(said))}; product says {', '.join(sorted(actual))}"))
+        low = meta.lower()
+        promised = [p for p in PROMISES if p in low and p not in own.lower()
+                    and not (p == "free delivery" and not _is_euronics(product))]
+        if promised:
+            issues.append(("promise to check", "meta says: " + ", ".join(promised)))
+    if "lunneys" in (product.get("meta_title") or "").lower():
+        issues.append(("meta title repeats Lunneys", "the site adds ' | Lunneys' itself"))
+    return issues
+
+
+def load_api_config(path: Path) -> dict:
+    """Base URL and token from the Lunneys scripts config named in the office config."""
+    import configparser
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError) as exc:
+        raise ConfigError(f"could not read {path}: {exc}") from None
+    ini = (data.get("magento_api") or {}).get("config_ini") if isinstance(data, dict) else None
+    if not isinstance(ini, str) or not ini:
+        raise ConfigError(f'{path} has no "magento_api": {{"config_ini": ...}} setting')
+    parser = configparser.ConfigParser()
+    if not parser.read(ini, encoding="utf-8") or "magento" not in parser:
+        raise ConfigError(f"no [magento] section in {ini}")
+    base, token = parser["magento"].get("base_url", "").rstrip("/"), parser["magento"].get("token", "").strip()
+    if not SHARE_URL.fullmatch(base) or not token:
+        raise ConfigError("the [magento] base_url must be https://loshop.co.uk and a token must be set")
+    return {"base": base, "token": token}
+
+
+def _api_get(api: dict, path: str) -> dict:
+    req = urllib.request.Request(api["base"] + path, headers={
+        "Authorization": "Bearer " + api["token"], "User-Agent": "AgentOffice/1.0 (read-only check)"})
+    with _OPENER.open(req, timeout=120) as resp:  # noqa: S310 - site URL only
+        return json.loads(resp.read())
+
+
+def fetch_products(api: dict, page_size: int = 200, get=None) -> list[dict]:
+    """Every enabled product (status=1): sku, name, url_key and the copy attributes."""
+    get = get or (lambda path: _api_get(api, path))
+    fields = ("items[sku,name,status,visibility,custom_attributes[attribute_code,value]],"
+              "total_count")
+    products, page = [], 1
+    while True:
+        query = urllib.parse.urlencode({
+            "searchCriteria[filterGroups][0][filters][0][field]": "status",
+            "searchCriteria[filterGroups][0][filters][0][value]": "1",
+            "searchCriteria[pageSize]": page_size, "searchCriteria[currentPage]": page,
+            "fields": fields})
+        data = get(f"/rest/all/V1/products?{query}")
+        items = data.get("items") or []
+        for item in items:
+            ca = {a.get("attribute_code"): a.get("value") for a in item.get("custom_attributes") or []}
+            products.append({"sku": item.get("sku"), "name": item.get("name"),
+                             "visibility": item.get("visibility"), **{k: ca.get(k) for k in (
+                                 "url_key", "meta_title", "meta_description", "description",
+                                 "short_description", "is_euronics")}})
+        if not items or len(products) >= int(data.get("total_count") or 0) or page >= 100:
+            return products
+        page += 1
+
+
+def job_product_copy(args) -> JobResult:
+    spec = JOBS["product-copy"]
+    base = dict(job=spec.name, title=spec.title, desk=spec.desk, level=spec.level)
+    try:
+        api = load_api_config(Path(args.config))
+    except ConfigError as exc:
+        return JobResult(**base, status="NEEDS_YOU", summary=f"Not configured: {exc}.",
+                         next_step='Add "magento_api": {"config_ini": "<path to lunneys-scripts '
+                                   'config.ini>"} to ~/.agent-office/config.json.')
+    if not args.live:
+        return JobResult(**base, status="NEEDS_YOU", summary="Ready: run it live (read-only API).",
+                         next_step="python -m office.jobs run product-copy --live")
+    try:
+        products = fetch_products(api)
+    except Exception as exc:
+        return JobResult(**base, status="ERROR", live=True,
+                         summary=f"Could not read products: {str(exc)[:200]}")
+    rows = []
+    for p in products:
+        if p.get("visibility") == 1:  # not visible on the site: skip
+            continue
+        for issue, detail in check_product_copy(p):
+            rows.append({"issue": issue, "sku": p.get("sku"), "name": p.get("name"),
+                         "url": f"{SITE}/{p['url_key']}.html" if p.get("url_key") else "",
+                         "detail": detail, "meta_description": p.get("meta_description") or ""})
+    intray = Path(args.intray)
+    intray.mkdir(parents=True, exist_ok=True)
+    csv_path = intray / "product-copy.csv"
+    import csv
+    with csv_path.open("w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=["issue", "sku", "name", "url", "detail",
+                                                "meta_description"])
+        writer.writeheader()
+        for r in sorted(rows, key=lambda r: (r["issue"], str(r["name"]))):
+            writer.writerow({k: _csv_safe(v) for k, v in r.items()})
+    counts: dict[str, int] = {}
+    for r in rows:
+        counts[r["issue"]] = counts.get(r["issue"], 0) + 1
+    order = ["vacuum type contradiction", "power contradiction", "installation contradiction",
+             "promise to check", "name repeats words", "no meta description",
+             "meta description long", "meta title repeats Lunneys"]
+    findings = [f"{k}: {counts[k]}" for k in order if k in counts]
+    examples = [r for r in rows if "contradiction" in r["issue"] or r["issue"] == "promise to check"][:5]
+    findings += [f"e.g. {r['name']}: {r['detail']}" for r in examples]
+    findings.append(f"Full list: {csv_path}")
+    checked = sum(1 for p in products if p.get("visibility") != 1)
+    return JobResult(**base, live=True, status="NEEDS_YOU" if rows else "OK", findings=findings,
+                     summary=(f"{len({r['sku'] for r in rows})} of {checked} products have copy to check."
+                              if rows else f"All {checked} products' copy looks consistent."),
+                     next_step="Open the CSV, fix the worst first (contradictions, promises)."
+                     if rows else "")
+
+
 # ── share preview ─────────────────────────────────────────────────────────────
 
 SHARE_URL = re.compile(r"https://loshop\.co\.uk(?:/[^\s<>\"'\\]{0,400})?")
@@ -999,6 +1184,7 @@ def job_morning_briefing(args) -> JobResult:
 RUNNERS = {
     "backup-check": job_backup_check,
     "share-preview": job_share_preview,
+    "product-copy": job_product_copy,
     "crontab-guard": job_crontab_guard,
     "morning-briefing": job_morning_briefing,
     "social-batch": job_social_batch,

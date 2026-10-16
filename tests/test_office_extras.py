@@ -7,6 +7,7 @@ fetches, SSH and PowerShell are all replaced.
 from __future__ import annotations
 
 import base64
+import re
 import json
 import subprocess
 import time
@@ -267,3 +268,99 @@ def test_redirects_off_the_site_are_refused():
 def test_odd_backup_listings_do_not_crash(listing, status, needle):
     got, findings = jobs.check_backups(listing, NOW, 7, 20)
     assert got == status and any(needle in f for f in findings), findings
+
+
+
+# ── product copy check ────────────────────────────────────────────────────────
+
+def _p(**kw):
+    base = {"sku": "1", "name": "Bosch Serie 4 Washing Machine", "url_key": "bosch-wm",
+            "meta_title": "Bosch Serie 4", "visibility": 4,
+            "meta_description": "Bosch Serie 4 washing machine with quick wash.",
+            "description": "<p>A freestanding washing machine.</p>", "short_description": ""}
+    return {**base, **kw}
+
+
+def test_clean_product_has_no_issues():
+    assert jobs.check_product_copy(_p()) == []
+
+
+@pytest.mark.parametrize("product,issue", [
+    (_p(name="Dyson BIG BALL Dyson Big Ball - CY26 653668-01"), "name repeats words"),
+    (_p(name="Dyson Big Ball CY26", meta_description="Dyson Big Ball CY26 upright vacuum cleaner.",
+        description="The Dyson Big Ball cylinder vacuum features cyclones."), "vacuum type contradiction"),
+    (_p(meta_description="A cordless vacuum.", description="Powerful corded vacuum."), "power contradiction"),
+    (_p(meta_description="Integrated washing machine.", description="A freestanding washer."),
+     "installation contradiction"),
+    (_p(meta_description="Great washer. Free delivery on orders.", is_euronics="1"), "promise to check"),
+    (_p(meta_description="Great washer. Next day delivery."), "promise to check"),
+    (_p(meta_description=""), "no meta description"),
+    (_p(meta_description="x" * 170), "meta description long"),
+    (_p(meta_title="Bosch Serie 4 | Lunneys Electrical"), "meta title repeats Lunneys"),
+])
+def test_copy_issues(product, issue):
+    assert issue in [i for i, _ in jobs.check_product_copy(product)]
+
+
+def test_no_false_alarms():
+    # model numbers repeating digits, a promise the product page itself makes, "freestanding"
+    # matched as a whole word only, stick vacuums counted as cordless
+    assert jobs.repeated_phrase("LG 55 inch 55UR78 TV 55 inch") == "55 inch"
+    assert jobs.repeated_phrase("Samsung 1 2 3 1 2 3") is None
+    assert jobs.check_product_copy(_p(meta_description="Free delivery included.",
+                                      description="Free delivery included on this item.")) == []
+    assert jobs.check_product_copy(_p(meta_description="Cordless stick vacuum.",
+                                      description="A stick vacuum that is cordless.")) == []
+
+
+def test_fetch_products_pages_until_done():
+    pages = {1: {"items": [{"sku": "a", "name": "A", "custom_attributes": [
+                 {"attribute_code": "meta_description", "value": "m"}]}], "total_count": 2},
+             2: {"items": [{"sku": "b", "name": "B", "custom_attributes": []}], "total_count": 2}}
+    seen = []
+
+    def get(path):
+        seen.append(path)
+        assert path.startswith("/rest/all/V1/products?") and "status" in path
+        return pages[int(path.split("currentPage%5D=")[1].split("&")[0])]
+    products = jobs.fetch_products({"base": "x", "token": "t"}, page_size=1, get=get)
+    assert [p["sku"] for p in products] == ["a", "b"] and products[0]["meta_description"] == "m"
+    assert len(seen) == 2
+
+
+def test_product_copy_job_writes_a_safe_csv(tmp_path, monkeypatch):
+    ini = tmp_path / "scripts.ini"
+    ini.write_text("[magento]\nbase_url = https://loshop.co.uk\ntoken = SECRET-TOKEN\n", encoding="utf-8")
+    config = tmp_path / "c.json"
+    config.write_text(json.dumps({"magento_api": {"config_ini": str(ini)}}), encoding="utf-8")
+    monkeypatch.setattr(jobs, "fetch_products", lambda api: [
+        _p(sku="1", name="=HYPERLINK(1) Dyson Dyson x x", meta_description="Free delivery.",
+           is_euronics="1"),
+        _p(sku="2"), _p(sku="3", visibility=1, name="Hidden Hidden Hidden Hidden")])
+    code, result, intray = _run(tmp_path, "run", "product-copy", "--live", config=config)
+    assert code == 0 and result["status"] == "NEEDS_YOU"
+    assert result["summary"] == "1 of 2 products have copy to check."
+    text = (intray / "product-copy.csv").read_text(encoding="utf-8")
+    assert "'=HYPERLINK" in text and "Hidden" not in text and "SECRET-TOKEN" not in text
+    assert "SECRET-TOKEN" not in json.dumps(result)
+
+
+@pytest.mark.parametrize("ini_text,needle", [
+    ("[magento]\nbase_url = https://evil.example\ntoken = t\n", "base_url"),
+    ("[magento]\nbase_url = https://loshop.co.uk\ntoken =\n", "token"),
+    ("[other]\nx = 1\n", "[magento]"),
+])
+def test_api_config_is_checked(tmp_path, ini_text, needle):
+    ini = tmp_path / "s.ini"
+    ini.write_text(ini_text, encoding="utf-8")
+    config = tmp_path / "c.json"
+    config.write_text(json.dumps({"magento_api": {"config_ini": str(ini)}}), encoding="utf-8")
+    with pytest.raises(jobs.ConfigError, match=re.escape(needle)):
+        jobs.load_api_config(config)
+
+
+def test_free_delivery_is_fine_except_on_euronics_items():
+    meta = "Bosch washer. Free delivery available."
+    assert jobs.check_product_copy(_p(meta_description=meta)) == []
+    assert jobs.check_product_copy(_p(meta_description=meta, is_euronics="0")) == []
+    assert [i for i, _ in jobs.check_product_copy(_p(meta_description=meta, is_euronics="1"))] ==         ["promise to check"]

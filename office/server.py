@@ -42,6 +42,7 @@ ROOT = Path(__file__).resolve().parent.parent
 BUTTONS: dict[str, list[tuple[str, bool]]] = {
     "backup-check": [("Run live", True)],
     "share-preview": [("Check link", True)],
+    "product-copy": [("Run live", True)],
     "crontab-guard": [("Run live", True)],
     "morning-briefing": [("Run", False), ("Run live", True)],
     "social-batch": [("Run", False)],
