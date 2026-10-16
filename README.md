@@ -29,6 +29,7 @@ This is a **research prototype**, not a production system. Read
 |---|---|---|
 | **Relay** (`relay/`) | Validates a task against policy, copies the target repository into a disposable workspace under an exclusive lease, runs the Claude Code worker there with a restricted tool allowlist and curated environment, then **independently verifies** the result: workspace integrity (hash manifest), protected tests and test configuration, required tests, acceptance criteria. Records everything in an append-only audit log. | Execution state of a Relay task (`relay.db`) |
 | **A2A ledger** (`a2a/`) | Tracks a task through the frozen [A2A protocol v0.2](docs/a2a-protocol-v0.2.md): enforces the state graph, tier paths, which role may take each step, required evidence, the Relay evidence link, and the T3 human re-run — and records each step in an append-only history. | Protocol state of an A2A task (`a2a.db`) |
+| **Agent Office** (`office/`) | A read-only dashboard over both databases (`python -m office`) and the morning in-tray jobs (`python -m office.jobs`): crontab guard, morning briefing, weekly social batch, category images (CCP 3), Reviews.io reply pack. Jobs report or prepare drafts; none writes to a live system. | Nothing — it only reads |
 
 The two are linked **by reference**: an A2A task can only enter review (T2/T3)
 or Gate 2 (T1) by citing a Relay task that is `COMPLETED`. A2A reads the Relay
@@ -105,14 +106,35 @@ transcript; the committed one is in
 ## One real Claude run
 
 ```bash
+python demo/save_api_key.py             # or double-click "Save API key.bat": paste, save, check
 python demo/real_run.py                 # uses ~/.relay_api_key.txt; small API cost
 ```
+
+`save_api_key.py` takes the key from the clipboard or a hidden prompt, saves it
+to `~/.relay_api_key.txt`, and checks it with Anthropic's free models endpoint.
+It never prints the key.
 
 Runs `sample_task.json` with the real Claude Code CLI against a throwaway copy
 of `test-repository/` and writes a Markdown report (status, Relay's
 verification, the worker's diff, the commands and their output). A successful
 run ends in `ACCEPTANCE_REQUIRED`: the sample's numeric criteria are yours to
 check and acknowledge.
+
+## The office: dashboard and in-tray
+
+```bash
+python -m office.jobs list                       # the five in-tray jobs
+python -m office.jobs run social-batch           # reads ~/lunneys-social, read-only
+python -m office.jobs run crontab-guard --live   # read-only SSH: crontab -l
+python -m office.jobs run morning-briefing       # add --live for robots.txt + sitemap
+python -m office                                 # writes office.html
+```
+
+`office.html` shows what is waiting on you (Relay decisions, A2A gates, the T3
+re-run), the in-tray results, audit-chain and ledger health, and recent activity
+by desk. It opens both databases read-only (their contents are never changed) and executes nothing; every action is
+a command for you to run. Jobs that read the live server or website refuse to do
+so without `--live`. Details: [operator guide §9](docs/operator-guide.md#9-the-office-dashboard-and-in-tray).
 
 ## Operating it
 

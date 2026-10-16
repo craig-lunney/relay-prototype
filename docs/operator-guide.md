@@ -203,3 +203,51 @@ The relay database is read **read-only** (`--relay-db`, default `relay.db`). Onl
 - Workspaces of `COMPLETED`, `FAILED` and `TIMEOUT` tasks are deleted unless you passed `--keep-workspace`. Workspaces for `ACCEPTANCE_REQUIRED` tasks are kept, and stay after you acknowledge; recovered workspaces are moved aside. Delete them when you're done.
 - Back up `relay.db` and `a2a.db` like any other record. They are plain SQLite files.
 - Read `docs/limitations.md` for what these controls do and do not protect against.
+
+---
+
+## 9. The office: dashboard and in-tray
+
+```bash
+python -m office --relay-db relay.db --a2a-db a2a.db --out office.html [--intray DIR]
+python -m office.jobs [--intray DIR] list
+python -m office.jobs [--intray DIR] run <job> [--live] [job options]
+```
+
+The in-tray folder defaults to `~/.agent-office/intray`. Each run writes
+`<job>.json` there (status, summary, findings, next step); the dashboard shows
+the latest result of every job. The exit code is 1 when a job's status is
+`ALERT` or `ERROR`, so a scheduler can notice.
+
+| Job | Level | What it does | Live access |
+|---|---|---|---|
+| `crontab-guard` | Report | `crontab -l` on your server; alerts if it has fewer lines than the baseline or if a required entry is missing or commented out. Extra lines are reported, not alerted. Server details come from the local config file below. | Read-only SSH, only with `--live` (key-based; `BatchMode`, so it never prompts). |
+| `morning-briefing` | Report | One page (`morning-briefing-YYYY-MM-DD.md`): what's waiting on you, every other job's latest result, and with `--live` the robots.txt guard (Googlebot rules, AI-crawler block, apex sitemap line, no query-string Disallow) and the sitemap. | HTTPS GET of two public URLs, only with `--live`. |
+| `social-batch` | Draft | Picks approved knowledge items (`LUNNEYS_APPROVED` + `APPROVED`) that have no approved visual yet, one per category first, and prints the `knowledge_run.py` commands. You approve at Gate 1 and Gate 2 as usual. `--social-repo`, `--count`. | None; reads the Lunneys Social folder. |
+| `category-images` | Change (plan only) | The CCP 3 job card and the `a2a create-task` command to start it as a T2 task. | None. |
+| `reviews-replies` | Draft | With `--input reviews.json` (a list of `{name, rating, text, product}`), writes `reviews-reply-brief.md`: reply rules, reviews to draft, and anything rated 3 or below for you first. Posts nothing. | None. |
+
+The crontab guard reads its server details from `~/.agent-office/config.json`
+(`--config` to use another file), which stays on your machine and out of the
+repository:
+
+```json
+{
+  "crontab_guard": {
+    "ssh_target": "user@your-host.example",
+    "ssh_port": 22,
+    "ssh_options": ["MACs=hmac-sha2-256"],
+    "baseline_lines": 25,
+    "required_entries": {"Magento cron": "bin/magento cron:run"}
+  }
+}
+```
+
+`ssh_options` may only set algorithm, key and known-hosts options; anything that
+could run a command (such as `ProxyCommand`) is refused. Without a config file the
+job reports "Not configured" and does nothing.
+
+Run the live checks yourself the first time and read the output before you
+schedule them. Nothing in the office writes to the server, the website,
+Buffer, Reviews.io or Base.
+

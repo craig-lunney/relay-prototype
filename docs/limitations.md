@@ -156,6 +156,24 @@ is the human's attestation.
 - The lease PID is Relay's own; a crashed Relay with a still-running Claude child
   is treated as stale (see accept-recovery above).
 
+## 9. Agent Office (dashboard and in-tray)
+
+- The dashboard is a static snapshot; regenerate it to refresh. Its integrity
+  section re-checks the audit chain and compares each ledger task's state with
+  its last recorded step; it does not replace `a2a check`.
+- In-tray results are plain JSON files in the operator's home folder. Anyone
+  with file access can edit them; they are notes, not evidence.
+- The crontab guard's baseline and required entries live in the local config
+  file (`~/.agent-office/config.json`); raise the baseline when jobs are added on
+  purpose. A replaced line (same count, different job) is only caught if it was
+  one of the required entries.
+- `social-batch` treats an item as used once it has an approved visual; it does
+  not know whether the post was actually published.
+- `reviews-replies` needs an exported reviews file until Reviews.io is
+  connected; the Base.com sections of the briefing need the Base MCP.
+- The dashboard never changes either database's contents, but SQLite may leave
+  `-wal`/`-shm` side files next to a database that uses WAL mode.
+
 ## Deferred beyond v1
 
 GitHub API integration · OS-level sandboxing · operator authentication ·

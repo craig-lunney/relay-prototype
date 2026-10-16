@@ -15,10 +15,12 @@ dev = ["pytest>=7", "setuptools>=68"]
 [project.scripts]
 relay = "relay.cli:main"
 a2a   = "a2a.cli:main"
+office = "office.dashboard:main"
+office-jobs = "office.jobs:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["relay*", "a2a*"]
+include = ["relay*", "a2a*", "office*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
