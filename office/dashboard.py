@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import html
 import json
+import re
 import sqlite3
 import sys
 from contextlib import closing
@@ -211,7 +212,11 @@ def load_intray(folder: Path, snap: Snapshot, retired: frozenset[str] = frozense
         if not isinstance(data, dict):
             continue
         findings = data.get("findings")
+        preview = data.get("preview")
         snap.intray.append({
+            "preview": ({k: str(preview.get(k) or "") for k in ("url", "site", "title",
+                                                                 "description", "image")}
+                        if isinstance(preview, dict) else None),
             **{k: ("" if data.get(k) is None else str(data.get(k)))
                for k in ("job", "title", "desk", "level", "status", "summary",
                          "next_step", "generated_at")},
@@ -245,6 +250,26 @@ _STATUS_COLOURS = {
     "OK": "#DFF3EA", "READY": "#E1EEFF", "NEEDS_YOU": "#FFF4DE",
     "NEEDS_CONNECTION": "#EEF2F8", "ALERT": "#FFE2DA", "ERROR": "#FFE2DA",
 }
+
+
+_SITE_IMAGE = re.compile(r"https://loshop\.co\.uk/[^\s\"'<>]+")
+
+
+def _share_card(preview: dict | None) -> str:
+    """A Facebook-style link card. The image is only shown when it is on loshop.co.uk."""
+    if not preview:
+        return ""
+    image = preview.get("image", "")
+    img = (f'<img src="{_e(image)}" alt="" style="display:block;width:100%;aspect-ratio:1.91/1;'
+           f'object-fit:cover;background:#eee">' if _SITE_IMAGE.fullmatch(image)
+           else '<div style="aspect-ratio:1.91/1;background:#eee;display:grid;place-items:center">'
+                '<span class="muted">no share image</span></div>')
+    return (f'<div style="max-width:520px;margin-top:10px;border:1px solid #ccd0d5;background:#fff;'
+            f'color:#050505">{img}<div style="background:#f0f2f5;padding:10px 12px">'
+            f'<div style="color:#65676b;font-size:12px">{_e(preview.get("site"))}</div>'
+            f'<div style="font-weight:700">{_e(preview.get("title"))}</div>'
+            f'<div style="color:#65676b;font-size:14px;overflow:hidden;white-space:nowrap;'
+            f'text-overflow:ellipsis">{_e(preview.get("description"))}</div></div></div>')
 
 
 def _pill(text) -> str:
@@ -319,6 +344,7 @@ pre{{white-space:pre-wrap;word-break:break-word;font-family:Consolas,ui-monospac
                 f'<div>{_e(j.get("summary"))}</div>'
                 + ("<ul>" + "".join(f"<li>{_e(f)}</li>" for f in findings[:14]) + "</ul>" if findings else "")
                 + (f'<div><code>{_e(j.get("next_step"))}</code></div>' if j.get("next_step") else "")
+                + _share_card(j.get("preview"))
                 + "</div>")
         parts.append("</div>")
     else:

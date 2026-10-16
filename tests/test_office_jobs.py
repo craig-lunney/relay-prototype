@@ -673,7 +673,7 @@ def test_fetch_turns_http_errors_into_statuses(monkeypatch):
 
     def boom(req, timeout):
         raise urllib.error.HTTPError(req.full_url, 404, "nf", {}, None)
-    monkeypatch.setattr(jobs.urllib.request, "urlopen", boom)
+    monkeypatch.setattr(jobs._OPENER, "open", boom)
     assert REAL_FETCH("https://loshop.co.uk/x.html") == (404, "")
 
 

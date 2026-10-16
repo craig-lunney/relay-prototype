@@ -99,6 +99,7 @@ class JobResult:
     next_step: str = ""
     live: bool = False
     generated_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    preview: dict | None = None  # share-preview only: what a shared link shows
 
 
 @dataclass(frozen=True)
@@ -112,6 +113,14 @@ class JobSpec:
 
 
 JOBS: dict[str, JobSpec] = {
+    "backup-check": JobSpec(
+        "backup-check", "Backup check", "The Inspector", "REPORT", True,
+        "Checks how old the newest full database copy on the server is, and that it is not "
+        "unexpectedly small."),
+    "share-preview": JobSpec(
+        "share-preview", "Share preview", "The Designer", "REPORT", True,
+        "Shows how a loshop.co.uk link will look when shared on Facebook or WhatsApp, and "
+        "flags a missing, broken or badly sized share image."),
     "crontab-guard": JobSpec(
         "crontab-guard", "Crontab guard", "The Inspector", "REPORT", True,
         "Checks the live crontab has not shrunk below its baseline and that the key entries "
@@ -192,12 +201,105 @@ def load_guard_config(path: Path) -> dict:
             "baseline_lines": baseline, "required_entries": required}
 
 
-def ssh_command(cfg: dict) -> list[str]:
-    """The one read-only command the guard runs: `crontab -l` over key-based SSH."""
+def ssh_command(cfg: dict, remote: str = "crontab -l") -> list[str]:
+    """A read-only command over key-based SSH (never prompts). Default: `crontab -l`."""
     cmd = ["ssh", "-p", str(cfg["ssh_port"])]
     for option in cfg["ssh_options"]:
         cmd += ["-o", option]
-    return cmd + ["-o", "BatchMode=yes", "-o", "ConnectTimeout=15", cfg["ssh_target"], "crontab -l"]
+    return cmd + ["-o", "BatchMode=yes", "-o", "ConnectTimeout=15", cfg["ssh_target"], remote]
+
+
+# ── backup check ──────────────────────────────────────────────────────────────
+
+_SAFE_GLOB = re.compile(r"/[A-Za-z0-9_./*-]+")
+
+
+def load_backup_config(path: Path) -> dict:
+    """The backup_check section (plus SSH details from crontab_guard) of the local config."""
+    guard = load_guard_config(path)
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError) as exc:
+        raise ConfigError(f"could not read {path}: {exc}") from None
+    cfg = data.get("backup_check") if isinstance(data, dict) else None
+    if not isinstance(cfg, dict):
+        raise ConfigError(f'{path} has no "backup_check" section')
+    glob = cfg.get("glob")
+    if not isinstance(glob, str) or not _SAFE_GLOB.fullmatch(glob) or ".." in glob:
+        raise ConfigError('"glob" must be an absolute path pattern like /home/user/backups/db_*.sql')
+    days, min_mb = cfg.get("max_age_days", 7), cfg.get("min_mb", 20)
+    for name, value, top in (("max_age_days", days, 60), ("min_mb", min_mb, 100_000)):
+        if not isinstance(value, int) or isinstance(value, bool) or not 1 <= value <= top:
+            raise ConfigError(f'"{name}" must be a number from 1 to {top}')
+    return {**guard, "glob": glob, "max_age_days": days, "min_mb": min_mb}
+
+
+def check_backups(listing: str, now: float, max_age_days: int, min_mb: int) -> tuple[str, list[str]]:
+    """(status, findings) from `stat -c '%Y %s %n'` lines, oldest first."""
+    files = []
+    for line in listing.splitlines():
+        m = re.fullmatch(r"([0-9]{1,12}) ([0-9]{1,15}) (\S.*)", line.strip())
+        if m:
+            files.append((int(m.group(1)), int(m.group(2)), m.group(3)))
+    if not files:
+        return "ALERT", ["No full database copies found on the server."]
+    files.sort()
+    when, size, name = files[-1]
+    age_days = (now - when) / 86400
+    try:
+        stamp = uk_time(datetime.fromtimestamp(when, timezone.utc))
+    except (OverflowError, OSError, ValueError):
+        stamp = "unknown date"
+    findings = [f"Newest: {name.rsplit('/', 1)[-1]}, {stamp}, "
+                f"{size / 1_048_576:.0f} MB ({age_days:.1f} days old)"]
+    status = "OK"
+    if age_days < -1:
+        status = "ALERT"
+        findings.append("The newest copy is dated in the future: the server clock or the file is wrong.")
+    if len(files) > 1:
+        p_when, p_size, p_name = files[-2]
+        findings.append(f"Previous: {p_name.rsplit('/', 1)[-1]}, {p_size / 1_048_576:.0f} MB")
+        if p_size and size < 0.8 * p_size:
+            status = "ALERT"
+            findings.append("The newest copy is much smaller than the previous one: check it is complete.")
+    if size < min_mb * 1_048_576:
+        status = "ALERT"
+        findings.append(f"The newest copy is under {min_mb} MB: it may be incomplete.")
+    if age_days > max_age_days:
+        status = "ALERT"
+        findings.append(f"The newest copy is older than {max_age_days} days. Copies are only made by "
+                        "hand before site changes; Krystal's own daily backups (cPanel, JetBackup) "
+                        "are the safety net in between.")
+    return status, findings
+
+
+def job_backup_check(args) -> JobResult:
+    spec = JOBS["backup-check"]
+    base = dict(job=spec.name, title=spec.title, desk=spec.desk, level=spec.level)
+    try:
+        cfg = load_backup_config(Path(args.config))
+    except ConfigError as exc:
+        return JobResult(**base, status="NEEDS_YOU", summary=f"Not configured: {exc}.",
+                         next_step=("Add a backup_check section to ~/.agent-office/config.json "
+                                    "(see docs/operator-guide.md section 9)."))
+    if not args.live:
+        return JobResult(**base, status="NEEDS_YOU", summary="Ready: run it live (read-only SSH).",
+                         next_step="python -m office.jobs run backup-check --live")
+    remote = f"stat -c '%Y %s %n' {cfg['glob']} 2>/dev/null | sort -n | tail -2"
+    try:
+        r = subprocess.run(ssh_command(cfg, remote), capture_output=True, text=True,
+                           encoding="utf-8", errors="replace", timeout=60)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return JobResult(**base, status="ERROR", summary=f"Could not reach the server: {exc}", live=True)
+    if r.returncode != 0 and not r.stdout.strip():
+        return JobResult(**base, status="ERROR", live=True,
+                         summary=f"ssh exited {r.returncode}: {r.stderr.strip()[:200]}")
+    status, findings = check_backups(r.stdout, time.time(), cfg["max_age_days"], cfg["min_mb"])
+    return JobResult(**base, status=status, live=True, findings=findings,
+                     summary=("Latest full database copy looks fine." if status == "OK"
+                              else "The latest full database copy needs a look."),
+                     next_step="" if status == "OK" else
+                     "Before the next site change, take a fresh copy (the deploy preamble does this).")
 
 
 def check_crontab(text: str, baseline_lines: int | None = None,
@@ -411,6 +513,44 @@ def category_urls(sitemap_xml: str) -> list[str]:
     return parse_sitemap(sitemap_xml)[0]
 
 
+class _ShareTagParser(HTMLParser):
+    """Collects og:* and twitter:* meta tags (first of each) and the <title>."""
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.tags: dict[str, str] = {}
+        self.title = ""
+        self._in_title = False
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "title":
+            self._in_title = True
+        if tag != "meta":
+            return
+        a = {k.lower(): (v or "") for k, v in attrs}
+        key = (a.get("property") or a.get("name") or "").strip().lower()
+        if key.startswith(("og:", "twitter:")) and key not in self.tags:
+            self.tags[key] = a.get("content", "").strip()
+
+    def handle_endtag(self, tag):
+        if tag == "title":
+            self._in_title = False
+
+    def handle_data(self, data):
+        if self._in_title:
+            self.title += data
+
+
+def share_tags(page: str) -> tuple[dict[str, str], str]:
+    parser = _ShareTagParser()
+    try:
+        parser.feed(page)
+        parser.close()
+    except Exception:
+        pass
+    return parser.tags, " ".join(parser.title.split())
+
+
 class _OgImageParser(HTMLParser):
     def __init__(self):
         super().__init__(convert_charrefs=True)
@@ -585,6 +725,116 @@ def job_category_images(args) -> JobResult:
                    "approval for the live changes." if missing else ""))
 
 
+# ── share preview ─────────────────────────────────────────────────────────────
+
+SHARE_URL = re.compile(r"https://loshop\.co\.uk(?:/[^\s<>\"'\\]{0,400})?")
+DEFAULT_SHARE_IMAGE = "/media/logo/stores/1/logo.png"
+
+
+def _fetch_bytes(url: str, limit: int = 8_000_000) -> tuple[int, str, bytes]:
+    req = urllib.request.Request(url, headers={"User-Agent": "AgentOffice/1.0 (read-only check)"})
+    try:
+        with _OPENER.open(req, timeout=30) as resp:  # noqa: S310 - site URLs only
+            return resp.status, resp.headers.get("Content-Type", ""), resp.read(limit)
+    except urllib.error.HTTPError as exc:
+        return exc.code, "", b""
+
+
+def image_size(data: bytes) -> tuple[int, int] | None:
+    try:
+        from PIL import Image
+        import io
+        with Image.open(io.BytesIO(data)) as im:
+            return im.size
+    except Exception:
+        return None
+
+
+def check_share_tags(tags: dict, image: dict | None) -> tuple[str, list[str]]:
+    """(status, findings) for a page's share tags and its fetched image."""
+    findings, status = [], "OK"
+
+    def flag(level, text):
+        nonlocal status
+        findings.append(text)
+        if level == "ALERT" or status == "OK":
+            status = level
+    if not tags.get("og:title"):
+        flag("ALERT", "No og:title: the shared link has no headline.")
+    desc = tags.get("og:description", "")
+    if not desc:
+        flag("NEEDS_YOU", "No og:description: the shared link has no summary line.")
+    elif len(desc) > 300:
+        flag("NEEDS_YOU", f"og:description is {len(desc)} characters; under 200 reads best.")
+    url = tags.get("og:image", "")
+    if not url:
+        flag("ALERT", "No og:image: Facebook and WhatsApp will show no picture, or a random one.")
+    elif not url.startswith("https://"):
+        flag("ALERT", "og:image is not a full https:// address, so platforms cannot load it.")
+    elif image and image.get("status") == "off-site":
+        flag("NEEDS_YOU", "The share image is on another website, so it was not checked.")
+    elif image is None or image.get("status") != 200:
+        flag("ALERT", f"The share image does not load (HTTP {image and image.get('status')}).")
+    elif not str(image.get("type", "")).lower().startswith("image/"):
+        flag("ALERT", f"The share image address does not return an image ({image.get('type') or 'no type'}).")
+    else:
+        size = image.get("size")
+        if not size:
+            flag("NEEDS_YOU", "The share image could not be read (damaged, unusual format or too large).")
+        else:
+            w, h = size
+            findings.append(f"Image {w}x{h}, {image['bytes'] // 1024} KB.")
+            if w < 600:
+                flag("NEEDS_YOU", "The image is under 600 pixels wide: Facebook shows it as a small "
+                                  "thumbnail. 1200x630 is ideal.")
+            elif not 1.5 <= w / h <= 2.2:
+                flag("NEEDS_YOU", "The image is not wide (about 1.91:1), so platforms will crop it.")
+        if DEFAULT_SHARE_IMAGE in url:
+            findings.append("Uses the general Lunneys share image (this page has no picture of its own).")
+    if tags.get("twitter:card") not in (None, "summary_large_image"):
+        findings.append(f"twitter:card is {tags.get('twitter:card')!r}: X shows a small preview, "
+                        "not the large image.")
+    return status, findings
+
+
+def job_share_preview(args) -> JobResult:
+    spec = JOBS["share-preview"]
+    base = dict(job=spec.name, title=spec.title, desk=spec.desk, level=spec.level)
+    url = (args.url or "").strip()
+    if not SHARE_URL.fullmatch(url):
+        return JobResult(**base, status="ERROR",
+                         summary="Give a link on https://loshop.co.uk/ (other sites are not checked).")
+    if not args.live:
+        return JobResult(**base, status="NEEDS_YOU", summary="Ready: run it live to read the page.",
+                         next_step=f"python -m office.jobs run share-preview --live --url {url}")
+    try:
+        status_code, page = _fetch(url, limit=2_000_000)
+    except Exception as exc:
+        return JobResult(**base, status="ERROR", live=True, summary=f"Could not read the page: {exc}")
+    if status_code != 200:
+        return JobResult(**base, status="ERROR", live=True, summary=f"The page answered HTTP {status_code}.")
+    if _BOT_CHECK.search(page[:5000]):
+        return JobResult(**base, status="ERROR", live=True,
+                         summary="The host's bot check answered instead of the page; try again in a few minutes.")
+    tags, page_title = share_tags(page)
+    image = None
+    img_url = tags.get("og:image", "")
+    if img_url.startswith("https://") and not SHARE_URL.fullmatch(img_url):
+        image = {"status": "off-site"}
+    elif img_url.startswith("https://"):
+        try:
+            img_status, ctype, data = _fetch_bytes(img_url)
+            image = {"status": img_status, "type": ctype, "bytes": len(data), "size": image_size(data)}
+        except Exception as exc:
+            image = {"status": f"error ({exc})"}
+    status, findings = check_share_tags(tags, image)
+    preview = {"url": url, "site": "LOSHOP.CO.UK", "title": tags.get("og:title") or page_title,
+               "description": tags.get("og:description", ""), "image": img_url}
+    return JobResult(**base, status=status, live=True, findings=findings, preview=preview,
+                     summary=(f"Looks good when shared: {preview['title']}" if status == "OK"
+                              else f"Share preview needs attention: {preview['title'] or url}"))
+
+
 # ── Reviews.io replies ────────────────────────────────────────────────────────
 
 REPLY_RULES = [
@@ -656,11 +906,23 @@ def job_reviews_replies(args) -> JobResult:
 
 # ── morning briefing ──────────────────────────────────────────────────────────
 
+class _SiteOnlyRedirects(urllib.request.HTTPRedirectHandler):
+    """Follow redirects only to https://loshop.co.uk; anything else becomes an HTTP error."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if not SHARE_URL.fullmatch(newurl):
+            raise urllib.error.HTTPError(newurl, code, "redirect off this site refused", headers, fp)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+_OPENER = urllib.request.build_opener(_SiteOnlyRedirects)
+
+
 def _fetch(url: str, limit: int = 200_000) -> tuple[int, str]:
     """GET a public page: (status, first `limit` bytes as text). HTTP errors are statuses."""
     req = urllib.request.Request(url, headers={"User-Agent": "AgentOffice/1.0 (read-only check)"})
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:  # noqa: S310 - fixed https URLs
+        with _OPENER.open(req, timeout=30) as resp:  # noqa: S310 - site URLs only
             return resp.status, resp.read(limit).decode("utf-8", errors="replace")
     except urllib.error.HTTPError as exc:
         return exc.code, ""
@@ -698,7 +960,7 @@ def job_morning_briefing(args) -> JobResult:
         findings.append(f"Office databases not readable: {exc}")
     retired = retired_jobs(Path(args.config))
     for name in JOBS:
-        if name == "morning-briefing" or name in retired:
+        if name in ("morning-briefing", "share-preview") or name in retired:
             continue
         result = load_result(intray, name)
         if result is None:
@@ -735,6 +997,8 @@ def job_morning_briefing(args) -> JobResult:
 # ── plumbing ──────────────────────────────────────────────────────────────────
 
 RUNNERS = {
+    "backup-check": job_backup_check,
+    "share-preview": job_share_preview,
     "crontab-guard": job_crontab_guard,
     "morning-briefing": job_morning_briefing,
     "social-batch": job_social_batch,
@@ -780,6 +1044,7 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--social-repo", default=str(DEFAULT_SOCIAL_REPO))
     run.add_argument("--count", type=_positive_int, default=3)
     run.add_argument("--input", default=None, help="reviews JSON for reviews-replies")
+    run.add_argument("--url", default=None, help="the loshop.co.uk link for share-preview")
     run.add_argument("--delay", type=float, default=2.0,
                      help="seconds between page fetches in the category-images audit")
     run.add_argument("--max-minutes", type=_positive_int, default=50,

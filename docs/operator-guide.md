@@ -221,6 +221,8 @@ the latest result of every job. The exit code is 1 when a job's status is
 
 | Job | Level | What it does | Live access |
 |---|---|---|---|
+| `backup-check` | Report | Over SSH, lists the newest two files matching the configured pattern (`stat`, read-only) and alerts if the newest is older than `max_age_days` (7), under `min_mb` (20) or under 80% of the previous one. On loshop the copies are the manual `db_backup_*.sql` dumps taken before site changes; Krystal's own daily backups are not visible to it. | Read-only SSH, only with `--live`. |
+| `share-preview` | Report | For one `https://loshop.co.uk/` link (`--url`; other sites are refused): reads the page's og/twitter tags and fetches the share image; flags a missing title, description or image, an image that does not load, is under 600 px wide or is not about 1.91:1, and notes when the page uses the general Lunneys share image. The office shows a Facebook-style card. Not part of the morning briefing. | HTTPS GET of that page and its image, only with `--live`. |
 | `crontab-guard` | Report | `crontab -l` on your server; alerts if it has fewer lines than the baseline or if a required entry is missing or commented out. Extra lines are reported, not alerted. Server details come from the local config file below. | Read-only SSH, only with `--live` (key-based; `BatchMode`, so it never prompts). |
 | `morning-briefing` | Report | One page (`morning-briefing-YYYY-MM-DD.md`): what's waiting on you, every other job's latest result, and with `--live` the robots.txt guard (Googlebot rules, AI-crawler block, apex sitemap line, no query-string Disallow) and the sitemap. | HTTPS GET of two public URLs, only with `--live`. |
 | `social-batch` | Draft | Picks approved knowledge items (`LUNNEYS_APPROVED` + `APPROVED`) that have no approved visual yet, one per category first, and prints the `knowledge_run.py` commands. You approve at Gate 1 and Gate 2 as usual. `--social-repo`, `--count`. | None; reads the Lunneys Social folder. |
@@ -239,6 +241,11 @@ repository:
     "ssh_options": ["MACs=hmac-sha2-256"],
     "baseline_lines": 25,
     "required_entries": {"Magento cron": "bin/magento cron:run"}
+  },
+  "backup_check": {
+    "glob": "/home/user/backups/db_backup_*.sql",
+    "max_age_days": 7,
+    "min_mb": 20
   }
 }
 ```
@@ -251,6 +258,12 @@ Remove the name to bring it back.
 `ssh_options` may only set algorithm, key and known-hosts options; anything that
 could run a command (such as `ProxyCommand`) is refused. Without a config file the
 job reports "Not configured" and does nothing.
+
+### Alerts
+
+`python -m office.notify` shows a Windows notification when any job that is not
+retired last reported `ALERT` or `ERROR`; otherwise it does nothing.
+`--test` shows a test notification. The morning routine runs it after the jobs.
 
 ### The office app
 

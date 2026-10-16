@@ -172,6 +172,10 @@ is the human's attestation.
 - The office app trusts anyone who can use this computer's browser: its
   protections are against other websites, not other local users. Its buttons
   only run the jobs above; none changes a live system.
+- `backup-check` sees only files on the server matching its pattern. It cannot
+  see Krystal's account backups, and it does not test that a dump restores.
+- `share-preview` reads the page as a visitor; Facebook and WhatsApp keep their
+  own cached copy of a preview until they re-read the page.
 - The CCP 3 audit reads public pages. Fetching ~260 pages can trip the host's
   bot check; the audit backs off and retries once, then reports `bot check`
   for that page. Treat those rows as unknown, not as missing an image.

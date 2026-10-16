@@ -133,6 +133,9 @@ python -m office.jobs run morning-briefing       # add --live for robots.txt + s
 python -m office.jobs run category-images --live # CCP 3 audit of public category pages
 python -m office                                 # writes office.html
 python -m office.server                          # the office as an app: a button per job
+python -m office.jobs run backup-check --live    # age and size of the newest database copy
+python -m office.jobs run share-preview --live --url https://loshop.co.uk/   # link preview
+python -m office.notify                          # Windows notification if a job needs a look
 ```
 
 `office.html` shows what is waiting on you (Relay decisions, A2A gates, the T3

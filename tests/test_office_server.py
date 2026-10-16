@@ -216,3 +216,24 @@ def test_retired_job_is_hidden_and_refused(office):
     assert "Category images backfill" not in page
     assert run(office, "category-images", live=True)[0].status == 400
     assert office["calls"] == []
+
+
+def test_share_preview_link_box_and_validation(office):
+    _, page = request(office, "GET", "/")
+    assert 'name="url"' in page and 'type="url"' in page
+    body = {"token": office["state"].token, "job": "share-preview", "live": "1"}
+    assert request(office, "POST", "/run", {**body, "url": "https://evil.example/"})[0].status == 400
+    assert request(office, "POST", "/run", body)[0].status == 400
+    assert request(office, "POST", "/run", {"token": office["state"].token, "job": "crontab-guard",
+                                            "live": "1", "url": "https://loshop.co.uk/"})[0].status == 400
+    assert office["calls"] == []
+    resp, _ = request(office, "POST", "/run", {**body, "url": "https://loshop.co.uk/home-appliances.html"})
+    assert resp.status == 303
+    wait_idle(office)
+    argv = office["calls"][0]
+    assert argv[argv.index("--url") + 1] == "https://loshop.co.uk/home-appliances.html"
+
+
+def test_csp_allows_only_site_images(office):
+    resp, _ = request(office, "GET", "/")
+    assert "img-src https://loshop.co.uk;" in resp.getheader("Content-Security-Policy")

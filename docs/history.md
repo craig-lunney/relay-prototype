@@ -52,3 +52,4 @@ the work was done in batches, each independently reviewed before commit:
 | 6 — Audit hash chain (`ed70f18`) | Tamper-evident Relay audit log; `relay audit --verify`; one-command real run (`demo/real_run.py`) |
 | 7 — Agent Office | Read-only dashboard (`python -m office`); five morning in-tray jobs (`python -m office.jobs`) |
 | 8 — Office app and CCP 3 Phase 1 | `python -m office.server` (a button per job, this computer only); public-page CCP 3 category-image audit; UK time on every office page |
+| 9 — More office jobs | Backup check, share-preview checker with a link box, Windows alerts in the morning routine, retiring jobs |

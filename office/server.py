@@ -34,12 +34,14 @@ from typing import Callable
 from urllib.parse import parse_qs
 
 from .dashboard import render, snapshot
-from .jobs import DEFAULT_CONFIG, DEFAULT_INTRAY, JOBS, retired_jobs, uk_time
+from .jobs import DEFAULT_CONFIG, DEFAULT_INTRAY, JOBS, SHARE_URL, retired_jobs, uk_time
 
 ROOT = Path(__file__).resolve().parent.parent
 # The buttons each job gets: (label, live). A live-only job has no offline button,
 # because its offline run only says "ready" (and would hide the last live result).
 BUTTONS: dict[str, list[tuple[str, bool]]] = {
+    "backup-check": [("Run live", True)],
+    "share-preview": [("Check link", True)],
     "crontab-guard": [("Run live", True)],
     "morning-briefing": [("Run", False), ("Run live", True)],
     "social-batch": [("Run", False)],
@@ -52,6 +54,7 @@ JOB_TIMEOUTS = {"category-images": 3600}          # the audit fetches ~260 pages
 MAX_BODY = 4096
 SECURITY_HEADERS = {
     "Content-Security-Policy": ("default-src 'none'; style-src 'unsafe-inline'; "
+                                "img-src https://loshop.co.uk; "
                                 "form-action 'self'; frame-ancestors 'none'; base-uri 'none'"),
     "X-Frame-Options": "DENY",
     "X-Content-Type-Options": "nosniff",
@@ -79,20 +82,22 @@ class OfficeState:
     started_at: str | None = None
     last: dict | None = None
 
-    def job_argv(self, job: str, live: bool) -> list[str]:
+    def job_argv(self, job: str, live: bool, url: str | None = None) -> list[str]:
         argv = [sys.executable, "-B", "-m", "office.jobs", "--intray", str(self.intray),
                 "--config", str(self.config), "run", job,
                 "--relay-db", str(self.relay_db), "--a2a-db", str(self.a2a_db)]
+        if url:
+            argv += ["--url", url]
         return argv + (["--live"] if live else [])
 
-    def start_job(self, job: str, live: bool) -> bool:
+    def start_job(self, job: str, live: bool, url: str | None = None) -> bool:
         """Start a job in the background. False if one is already running."""
         with self.lock:
             if self.running:
                 return False
             self.running = f"{JOBS[job].title}" + (" (live)" if live else "")
             self.started_at = uk_time(None, "%H:%M:%S")
-        argv = self.job_argv(job, live)
+        argv = self.job_argv(job, live, url)
         timeout = JOB_TIMEOUTS.get(job, JOB_TIMEOUT)
         threading.Thread(target=self._run, args=(argv, timeout), daemon=True).start()
         return True
@@ -140,6 +145,10 @@ def controls_html(state: OfficeState) -> str:
             f'<input type="hidden" name="token" value="{_e(state.token)}">'
             f'<input type="hidden" name="job" value="{_e(name)}">'
             + ('<input type="hidden" name="live" value="1">' if live else "")
+            + ('<input type="url" name="url" required placeholder="https://loshop.co.uk/..." '
+               'pattern="https://loshop\\.co\\.uk(/.*)?" aria-label="Link to check" '
+               'style="font:inherit;min-height:40px;padding:4px 8px;margin:0 8px 6px 0;width:100%;'
+               'box-sizing:border-box">' if name == "share-preview" else "")
             + f'<button type="submit"{cls}{disabled}>{_e(label)}</button></form>'
             for label, live, cls in buttons)
         parts.append(f'<div class="job"><strong>{_e(spec.title)}</strong>'
@@ -198,10 +207,21 @@ class OfficeHandler(BaseHTTPRequestHandler):
 
     do_HEAD = do_GET
 
+    def _drain(self) -> None:
+        """Read a small request body before refusing, so the client is not reset mid-send."""
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            return
+        if 0 < length <= MAX_BODY:
+            self.rfile.read(length)
+
     def do_POST(self):
         if not self._host_ok():
+            self._drain()
             return self._message(403, "This office only answers on this computer.")
         if self.path != "/run":
+            self._drain()
             return self._message(404, "Nothing here.")
         try:
             length = int(self.headers.get("Content-Length", "0"))
@@ -224,7 +244,13 @@ class OfficeHandler(BaseHTTPRequestHandler):
             return self._message(400, "That job is retired.")
         if (job and (live not in {is_live for _, is_live in BUTTONS.get(job, [])})):
             return self._message(400, "That job has no " + ("live" if live else "offline") + " mode.")
-        if not self.state.start_job(job, live):
+        url = (form.get("url") or [""])[0].strip() or None
+        if job == "share-preview":
+            if not url or not SHARE_URL.fullmatch(url):
+                return self._message(400, "Give a link on https://loshop.co.uk/.")
+        elif url:
+            return self._message(400, "That job takes no link.")
+        if not self.state.start_job(job, live, url):
             return self._message(409, "A job is already running: wait for it to finish.")
         self.send_response(303)
         self.send_header("Location", "/")
