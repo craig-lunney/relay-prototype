@@ -123,6 +123,11 @@ JOBS: dict[str, JobSpec] = {
         "Reads every enabled product (read-only) and flags names with repeated words, meta "
         "descriptions that contradict the product (upright vs cylinder, cordless vs corded...), "
         "promises to double-check (free delivery, next day...) and missing or long descriptions."),
+    "ai-readiness": JobSpec(
+        "ai-readiness", "AI shopping readiness", "The Inspector", "REPORT", True,
+        "Scores a sample of products on what Google AI Mode, ChatGPT and Perplexity rely on "
+        "(copy, brand/GTIN/MPN/price/stock, Product JSON-LD, share image) plus robots.txt and "
+        "llms.txt, and lists the top 10 fixes. Euronics agency items are reported separately."),
     "share-preview": JobSpec(
         "share-preview", "Share preview", "The Designer", "REPORT", True,
         "Shows how a loshop.co.uk link will look when shared on Facebook or WhatsApp, and "
@@ -1020,6 +1025,543 @@ def job_share_preview(args) -> JobResult:
                               else f"Share preview needs attention: {preview['title'] or url}"))
 
 
+# ── AI shopping readiness ─────────────────────────────────────────────────────
+
+AI_AREAS = ["Product copy", "Key attributes", "Structured data", "Share image"]
+SITE_AREA = "Crawler access"
+# Crawlers behind AI shopping answers: search indexes and assistants fetching a page for a user.
+AI_CRAWLERS = ["Googlebot", "Google-Extended", "Bingbot", "OAI-SearchBot", "ChatGPT-User", "GPTBot",
+               "PerplexityBot", "Perplexity-User", "ClaudeBot", "Claude-SearchBot", "Claude-User",
+               "Applebot"]
+# Appliances that carry an energy label; their size matters to buyers too.
+LABELLED = ("washing machine", "washer dryer", "tumble dryer", "heat pump dryer", "condenser dryer",
+            "vented dryer", "dishwasher", "fridge", "freezer", "oven", "cooker", "cooker hood",
+            "chimney hood", "extractor", "wine cooler", "tv", "television", "monitor")
+SIZED = LABELLED + ("microwave", "hob", "dehumidifier", "air conditioner")
+NOT_LABELLED = ("microwave", "rice cooker", "slow cooker", "pressure cooker", "multi cooker",
+                "multicooker", "filter", "accessory", "accessories", "kit", "cable", "bracket",
+                "stand", "cover", "hose", "bag", "bags", "remote", "mount", "shelf", "basket",
+                "cleaner", "descaler", "tablets", "salt", "adaptor", "adapter", "spare", "handle",
+                "seal", "bulb", "plug", "lead", "belt", "stacking")
+NOT_SIZED = tuple(w for w in NOT_LABELLED if w != "microwave")
+AI_ATTRS = ("url_key", "meta_title", "meta_description", "description", "short_description",
+            "is_euronics", "googleshopping_exclude", "brand", "ean", "mpn", "energy_rating",
+            "euronics_energy_label", "height", "width", "depth", "spec_height", "spec_width",
+            "spec_depth", "special_price", "ni_delivery_only")
+# issue: (weight 1-3, how to fix). Weight 3 = wrong or missing facts an AI answer would repeat.
+AI_FIXES = {
+    "vacuum type contradiction": (3, "Rewrite the meta description to match the product."),
+    "power contradiction": (3, "Rewrite the meta description to match the product."),
+    "installation contradiction": (3, "Rewrite the meta description to match the product."),
+    "promise to check": (3, "Remove promises the product does not get (product-copy job lists them)."),
+    "no meta description": (2, "Write a meta description: AI answers and shares quote it."),
+    "name repeats words": (1, "Tidy the product name."),
+    "meta description long": (1, "Trim the meta description to about 155 characters."),
+    "meta title repeats Lunneys": (1, "Drop 'Lunneys' from the meta title; the site adds it."),
+    "no brand": (2, "Set the Brand attribute: Merchant Center and AI answers group by brand."),
+    "no GTIN": (3, "Add the EAN barcode (ean attribute): Google matches products by GTIN."),
+    "GTIN invalid": (3, "Correct the EAN: wrong length or check digit."),
+    "no MPN": (2, "Set mpn to the manufacturer's model number."),
+    "MPN does not match model": (3, "The mpn differs from the model in the SKU and name: check "
+                                    "which is right and correct the other."),
+    "no price": (3, "Set a price."),
+    "no stock record": (2, "Give the product a stock record so availability is known."),
+    "no energy rating": (2, "Set energy_rating (A to G) on labelled appliances."),
+    "no dimensions": (2, "Set height, width and depth: 'will it fit?' is a common AI question."),
+    "excluded from Google Shopping": (2, "googleshopping_exclude=1 on a non-Euronics item keeps it "
+                                         "out of the feed AI Mode reads. Clear it unless deliberate."),
+    "no product page": (3, "The product has no url_key, so it has no page."),
+    "page not found": (3, "An enabled, visible product whose page does not load."),
+    "no Product JSON-LD": (3, "The page has no Product structured data: check Lunneys_SchemaEnhance."),
+    "JSON-LD: no name": (2, "Product JSON-LD is missing its name."),
+    "JSON-LD: no brand": (2, "Set the Brand attribute; SchemaEnhance reads it into the JSON-LD."),
+    "JSON-LD: no GTIN": (2, "Add the EAN; SchemaEnhance reads it into the JSON-LD as gtin13."),
+    "JSON-LD: no offer": (3, "Product JSON-LD has no offers block (price and availability)."),
+    "JSON-LD: no price": (3, "Product JSON-LD offer has no price."),
+    "JSON-LD: price differs from catalogue": (3, "The page's structured price does not match the "
+                                                 "product price: check special prices and caching."),
+    "JSON-LD: no availability": (3, "Product JSON-LD offer has no availability."),
+    "JSON-LD: availability differs from stock": (3, "The page says in stock when it is not, or the "
+                                                     "other way round: check stock and page cache."),
+    "JSON-LD: no delivery info": (2, "Add shippingDetails to the offer."),
+    "JSON-LD: free delivery on a Euronics item": (3, "SchemaEnhance gives every item free delivery; "
+                                                     "Euronics items do not get it."),
+    "JSON-LD: delivery area too wide": (3, "The item is NI delivery only, but the JSON-LD offers "
+                                           "delivery to all of GB: add the region to shippingDestination."),
+    "JSON-LD: no rating": (1, "Add aggregateRating from this product's own reviews (Reviews.io "
+                              "product reviews) where it has some. Never use the 4.9 store rating."),
+    "share image is the store logo": (2, "The product shares the store logo instead of its picture."),
+}
+_LD_SCRIPT = re.compile(r"<script[^>]+application/ld\+json[^>]*>(.*?)</script>", re.S | re.I)
+
+
+def gtin_ok(code) -> bool:
+    """True for an 8, 12, 13 or 14-digit GTIN with a correct check digit."""
+    digits = str(code or "").strip()
+    if not re.fullmatch(r"[0-9]{8}|[0-9]{12,14}", digits):
+        return False
+    total = sum(int(d) * (3 if i % 2 == 0 else 1) for i, d in enumerate(reversed(digits[:-1])))
+    return (10 - total % 10) % 10 == int(digits[-1])
+
+
+def _model(text) -> str:
+    return re.sub(r"[^A-Z0-9]", "", str(text or "").upper())
+
+
+def _mentions(name: str, phrases) -> bool:
+    low = " " + " ".join(_words(name)) + " "
+    return any(" " + " ".join(_words(p)) + " " in low for p in phrases)
+
+
+def _truthy(value) -> bool:
+    return str(value or "").strip().lower() in ("1", "true", "yes")
+
+
+def _number(value) -> float | None:
+    try:
+        number = float(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+    return number if number == number else None  # NaN is not a price
+
+
+def check_attributes(p: dict) -> list[tuple[str, str]]:
+    """[(issue, detail)] for the attributes a shopping feed and AI answers need."""
+    issues = []
+    name = p.get("name") or ""
+    if not str(p.get("brand_label") or "").strip():
+        issues.append(("no brand", "brand attribute empty"))
+    ean = str(p.get("ean") or "").strip()
+    if not ean:
+        issues.append(("no GTIN", "ean attribute empty"))
+    elif not gtin_ok(ean):
+        issues.append(("GTIN invalid", f"{ean}: wrong length or check digit"))
+    mpn, sku = str(p.get("mpn") or "").strip(), str(p.get("sku") or "")
+    if not _model(mpn):
+        issues.append(("no MPN", "mpn attribute empty"))
+    elif (len(_model(sku)) >= 5 and _model(sku) in _model(name)
+          and _model(mpn) not in _model(name) and _model(mpn) not in _model(sku)):
+        issues.append(("MPN does not match model", f"mpn {mpn}; SKU and name say {sku}"))
+    price = _number(p.get("price"))
+    if p.get("type_id", "simple") in ("simple", "virtual") and not (price and price > 0):
+        issues.append(("no price", f"price is {p.get('price')!r}"))
+    if p.get("in_stock") is None:
+        issues.append(("no stock record", "no stock item found"))
+    labelled = _mentions(name, LABELLED) and not _mentions(name, NOT_LABELLED)
+    if labelled and not (str(p.get("energy_label") or "").strip() or p.get("euronics_energy_label")):
+        issues.append(("no energy rating", "energy_rating empty on a labelled appliance"))
+    sized = _mentions(name, SIZED) and not _mentions(name, NOT_SIZED)
+    if sized and not all(str(p.get(k) or p.get("spec_" + k) or "").strip()
+                         for k in ("height", "width", "depth")):
+        issues.append(("no dimensions", "height, width or depth empty"))
+    if _truthy(p.get("googleshopping_exclude")) and not _is_euronics(p):
+        issues.append(("excluded from Google Shopping", "googleshopping_exclude=1"))
+    return issues
+
+
+def product_ld(page: str) -> dict | None:
+    """The first Product node in the page's JSON-LD (top level, list or @graph), or None."""
+    for m in _LD_SCRIPT.finditer(page):
+        try:
+            data = json.loads(m.group(1))
+        except ValueError:
+            continue
+        nodes = []
+        for node in data if isinstance(data, list) else [data]:
+            if isinstance(node, dict):
+                graph = node.get("@graph")
+                nodes += [n for n in graph if isinstance(n, dict)] if isinstance(graph, list) else [node]
+        for node in nodes:
+            kind = node.get("@type")
+            if kind == "Product" or (isinstance(kind, list) and "Product" in kind):
+                return node
+    return None
+
+
+def check_structured_data(ld: dict | None, p: dict) -> list[tuple[str, str]]:
+    """[(issue, detail)] for a page's Product JSON-LD, checked against the catalogue."""
+    if ld is None:
+        return [("no Product JSON-LD", "no Product structured data on the page")]
+    issues = []
+    if not ld.get("name"):
+        issues.append(("JSON-LD: no name", ""))
+    brand = ld.get("brand")
+    if not (brand.get("name") if isinstance(brand, dict) else brand):
+        issues.append(("JSON-LD: no brand", ""))
+    if not any(ld.get(k) for k in ("gtin13", "gtin", "gtin12", "gtin14", "gtin8")):
+        issues.append(("JSON-LD: no GTIN", ""))
+    offers = ld.get("offers")
+    offer = offers[0] if isinstance(offers, list) and offers else offers
+    if not isinstance(offer, dict):
+        issues.append(("JSON-LD: no offer", ""))
+    else:
+        price = _number(offer.get("price", offer.get("lowPrice")))
+        known = [n for n in (_number(p.get("price")), _number(p.get("special_price"))) if n]
+        if price is None:
+            issues.append(("JSON-LD: no price", ""))
+        elif known and not any(abs(price - n) < 0.005 for n in known):
+            issues.append(("JSON-LD: price differs from catalogue",
+                           f"page {price:.2f}; product {' / '.join(f'{n:.2f}' for n in known)}"))
+        availability = str(offer.get("availability") or "")
+        said = availability.rsplit("/", 1)[-1]
+        if not availability:
+            issues.append(("JSON-LD: no availability", ""))
+        elif p.get("in_stock") is not None and (said in ("InStock", "LimitedAvailability")) != p["in_stock"]:
+            issues.append(("JSON-LD: availability differs from stock",
+                           f"page says {said}; stock says {'in' if p['in_stock'] else 'out of'} stock"))
+        shipping = offer.get("shippingDetails")
+        shipping = [s for s in (shipping if isinstance(shipping, list) else [shipping]) if isinstance(s, dict)]
+        if not shipping:
+            issues.append(("JSON-LD: no delivery info", ""))
+        else:
+            rates = [s.get("shippingRate") for s in shipping]
+            if _is_euronics(p) and any(isinstance(r, dict) and _number(r.get("value")) == 0 for r in rates):
+                issues.append(("JSON-LD: free delivery on a Euronics item", "shippingRate value 0"))
+            destinations = [s.get("shippingDestination") for s in shipping]
+            regional = any(isinstance(d, dict) and (d.get("addressRegion") or d.get("postalCode")
+                                                    or d.get("postalCodeRange")) for d in destinations)
+            if _truthy(p.get("ni_delivery_only")) and not regional:
+                issues.append(("JSON-LD: delivery area too wide", "ni_delivery_only=1; page offers all of GB"))
+    if not ld.get("aggregateRating"):
+        issues.append(("JSON-LD: no rating", ""))
+    return issues
+
+
+def check_ai_crawlers(robots: str, url: str = SITE + "/") -> tuple[list[str], list[str]]:
+    """(AI crawlers that may not fetch `url`, other named agents that are blocked)."""
+    from urllib.robotparser import RobotFileParser
+    parser = RobotFileParser()
+    parser.parse(robots.replace("\r\n", "\n").splitlines())
+    blocked = [a for a in AI_CRAWLERS if not parser.can_fetch(a, url)]
+    named = re.findall(r"^\s*User-agent:\s*([^\s#*]+)", robots, flags=re.M | re.I)
+    others = [a for a in dict.fromkeys(named)
+              if a.lower() not in {c.lower() for c in AI_CRAWLERS} and not parser.can_fetch(a, url)]
+    return blocked, others
+
+
+def check_llms(status, text: str) -> list[str]:
+    """Problems with /llms.txt (empty when it is present and looks like Markdown)."""
+    if status != 200:
+        return [f"/llms.txt not found (HTTP {status})"]
+    body = text.lstrip("﻿").strip()
+    if _BOT_CHECK.search(text[:5000]) or body.startswith("<"):
+        return ["/llms.txt answers with a web page, not Markdown"]
+    problems = []
+    if not body.startswith("# "):
+        problems.append("/llms.txt does not start with a '# ' title")
+    if len(body) < 200:
+        problems.append(f"/llms.txt is very short ({len(body)} characters)")
+    return problems
+
+
+def fetch_catalogue(api: dict, page_size: int = 200, get=None) -> list[dict]:
+    """Every enabled product that is visible on the site, with the attributes AI shopping uses."""
+    get = get or (lambda path: _api_get(api, path))
+    fields = ("items[sku,name,price,status,visibility,type_id,"
+              "custom_attributes[attribute_code,value]],total_count")
+    products, page = [], 1
+    while True:
+        query = urllib.parse.urlencode({
+            "searchCriteria[filterGroups][0][filters][0][field]": "status",
+            "searchCriteria[filterGroups][0][filters][0][value]": "1",
+            "searchCriteria[filterGroups][1][filters][0][field]": "visibility",
+            "searchCriteria[filterGroups][1][filters][0][value]": "1",
+            "searchCriteria[filterGroups][1][filters][0][conditionType]": "neq",
+            "searchCriteria[pageSize]": page_size, "searchCriteria[currentPage]": page,
+            "fields": fields})
+        data = get(f"/rest/all/V1/products?{query}")
+        items = data.get("items") or []
+        for item in items:
+            ca = {a.get("attribute_code"): a.get("value") for a in item.get("custom_attributes") or []}
+            products.append({"sku": item.get("sku"), "name": item.get("name"), "price": item.get("price"),
+                             "type_id": item.get("type_id"), "visibility": item.get("visibility"),
+                             **{k: ca.get(k) for k in AI_ATTRS}})
+        if not items or len(products) >= int(data.get("total_count") or 0) or page >= 100:
+            return [p for p in products if p.get("visibility") != 1]
+        page += 1
+
+
+def attribute_labels(api: dict, code: str, get=None) -> dict[str, str]:
+    """{option id: label} for a dropdown attribute; {} if it cannot be read."""
+    get = get or (lambda path: _api_get(api, path))
+    try:
+        options = get(f"/rest/all/V1/products/attributes/{urllib.parse.quote(code)}/options")
+    except Exception:
+        return {}
+    return {str(o.get("value")): str(o.get("label") or "").strip()
+            for o in options if isinstance(o, dict) and str(o.get("value") or "")}
+
+
+def stock_status(api: dict, sku: str, get=None) -> bool | None:
+    """In stock (True/False) from the product's stock item, or None when it has none."""
+    get = get or (lambda path: _api_get(api, path))
+    try:
+        item = get(f"/rest/all/V1/stockItems/{urllib.parse.quote(str(sku), safe='')}")
+    except Exception:
+        return None
+    return bool(item.get("is_in_stock")) if isinstance(item, dict) and "is_in_stock" in item else None
+
+
+def pick_ai_sample(products: list[dict], size: int, seed: str) -> tuple[list[dict], list[dict]]:
+    """(scored sample, Euronics sample). Same seed, same sample; the default seed is the date."""
+    import random
+    rng = random.Random(seed)
+    ordered = sorted(products, key=lambda p: str(p.get("sku")))
+    scored = [p for p in ordered if not _is_euronics(p)]
+    euronics = [p for p in ordered if _is_euronics(p)]
+    return (rng.sample(scored, min(size, len(scored))),
+            rng.sample(euronics, min(max(5, size // 4), len(euronics))))
+
+
+class _Pacer:
+    """Keeps live fetches at least `delay` seconds apart."""
+
+    def __init__(self, delay: float):
+        self.delay, self.last = delay, None
+
+    def wait(self) -> None:
+        if self.delay and self.last is not None:
+            gap = self.delay - (time.monotonic() - self.last)
+            if gap > 0:
+                time.sleep(gap)
+        self.last = time.monotonic()
+
+
+def _paced_page(url: str, pace: _Pacer, bot_wait: float) -> tuple:
+    """(status, page); on the host's bot check, back off and retry once like the CCP 3 audit."""
+    pace.wait()
+    status, page = _fetch(url, limit=3_000_000)
+    if status == 200 and _BOT_CHECK.search(page[:5000]):
+        time.sleep(bot_wait)
+        pace.wait()
+        status, page = _fetch(url, limit=3_000_000)
+        if status == 200 and _BOT_CHECK.search(page[:5000]):
+            return "bot check", ""
+    return status, page
+
+
+def share_image_issues(page: str, pace: _Pacer) -> list[tuple[str, str]]:
+    """check_share_tags on a product page, with the og:image fetched like share-preview does."""
+    tags, _ = share_tags(page)
+    url, image = tags.get("og:image", ""), None
+    if url.startswith("https://") and not SHARE_URL.fullmatch(url):
+        image = {"status": "off-site"}
+    elif url.startswith("https://"):
+        try:
+            pace.wait()
+            status, ctype, data = _fetch_bytes(url)
+            image = {"status": status, "type": ctype, "bytes": len(data), "size": image_size(data)}
+        except Exception as exc:
+            image = {"status": f"error ({str(exc)[:80]})"}
+    status, findings = check_share_tags(tags, image)
+    issues = []
+    if status != "OK":
+        for text in findings:
+            if not text.startswith(("Image ", "Uses the general", "twitter:card")):
+                issues.append((re.split(r"[:(.]", text, maxsplit=1)[0].strip(), text))
+    if DEFAULT_SHARE_IMAGE in url or LOGO_FALLBACK in url:
+        issues.append(("share image is the store logo", url))
+    return issues
+
+
+def audit_ai_product(p: dict, pace: _Pacer, bot_wait: float = 20.0) -> dict:
+    """One product's issues per area; an area is None when it could not be checked."""
+    url = f"{SITE}/{p['url_key']}.html" if p.get("url_key") else ""
+    issues: dict[str, list | None] = {"Product copy": check_product_copy(p),
+                                      "Key attributes": check_attributes(p),
+                                      "Structured data": None, "Share image": None}
+    page_status = ""
+    if not url:
+        issues["Structured data"] = [("no product page", "no url_key")]
+    else:
+        try:
+            page_status, page = _paced_page(url, pace, bot_wait)
+        except Exception as exc:  # one bad page must not stop the audit
+            page_status, page = f"error: {str(exc)[:80]}", ""
+        if page_status == 200:
+            issues["Structured data"] = check_structured_data(product_ld(page), p)
+            issues["Share image"] = share_image_issues(page, pace)
+        elif isinstance(page_status, int):
+            issues["Structured data"] = [("page not found", f"HTTP {page_status}")]
+    return {"sku": p.get("sku"), "name": p.get("name"), "url": url, "page": page_status,
+            "euronics": _is_euronics(p), "issues": issues}
+
+
+def ai_scores(rows: list[dict]) -> dict[str, tuple[int, int]]:
+    """{area: (products clean, products checked)}."""
+    scores = {}
+    for area in AI_AREAS:
+        checked = [r["issues"][area] for r in rows if r["issues"].get(area) is not None]
+        scores[area] = (sum(1 for issues in checked if not issues), len(checked))
+    return scores
+
+
+def top_ai_fixes(rows: list[dict], site_problems: list[str], n: int = 10) -> list[dict]:
+    """The fixes worth most: weight x products affected; site problems affect every product."""
+    agg: dict[tuple[str, str], dict] = {}
+    for r in rows:
+        for area, issues in r["issues"].items():
+            for issue in dict.fromkeys(i for i, _ in issues or []):
+                fix = agg.setdefault((area, issue), {"area": area, "issue": issue, "skus": []})
+                fix["skus"].append(str(r["sku"]))
+    fixes = []
+    for fix in agg.values():
+        weight, hint = AI_FIXES.get(fix["issue"], (2, "See the share-preview job for this link."
+                                                   if fix["area"] == "Share image" else "See the CSV."))
+        fixes.append({**fix, "count": len(fix["skus"]), "weight": weight, "hint": hint})
+    for problem in site_problems:
+        fixes.append({"area": SITE_AREA, "issue": problem, "skus": [], "count": len(rows),
+                      "weight": 3, "hint": "Site-wide: affects every product page."})
+    fixes.sort(key=lambda f: (-f["weight"] * f["count"], -f["weight"], f["issue"]))
+    return fixes[:n]
+
+
+AI_CSV_FIELDS = ["group", "sku", "name", "url", "page", "issues"] + [a.lower().replace(" ", "_")
+                                                                     for a in AI_AREAS]
+
+
+def _issue_text(issues) -> str:
+    if issues is None:
+        return "not checked"
+    return "; ".join(f"{i} ({d})" if d else i for i, d in issues)
+
+
+def _write_ai_markdown(path: Path, rows, euronics_rows, scores, site, fixes, overall, total, note):
+    lines = ["# AI shopping readiness: loshop.co.uk", "",
+             f"Run {uk_time()} (UK time). Sample: {len(rows)} of {total} enabled, visible products "
+             f"(Euronics agency items reported separately). {note}".strip(), "",
+             f"**Overall score: {overall}/100**", "",
+             "| Area | Score | Clean |", "|---|---|---|"]
+    for area in AI_AREAS:
+        clean, checked = scores[area]
+        lines.append(f"| {area} | {round(100 * clean / checked) if checked else '-'} | "
+                     f"{clean} of {checked} products |")
+    lines.append(f"| {SITE_AREA} (site) | {site['score']} | {site['passed']} of 2 checks |")
+    lines += ["", "## Top fixes", ""]
+    if not fixes:
+        lines.append("Nothing to fix in this sample.")
+    for i, f in enumerate(fixes, 1):
+        who = (f"{f['count']} of {len(rows)} products" if f["skus"] else "site-wide")
+        examples = f" e.g. {', '.join(_md_cell(s) for s in f['skus'][:3])}." if f["skus"] else ""
+        lines.append(f"{i}. **{_md_cell(f['area'])}: {_md_cell(f['issue'])}** ({who}). "
+                     f"{_md_cell(f['hint'])}{examples}")
+    lines += ["", "## Site checks", ""] + [f"- {_md_cell(s)}" for s in site["lines"]]
+    lines += ["", "## Euronics agency items (not scored)", "",
+              "Euronics agency items are excluded from Google Shopping (googleshopping_exclude=1), "
+              "so they are not counted above. ChatGPT and Perplexity can still read their pages.", ""]
+    counts: dict[str, int] = {}
+    for r in euronics_rows:
+        for issues in r["issues"].values():
+            for issue in dict.fromkeys(i for i, _ in issues or []):
+                counts[issue] = counts.get(issue, 0) + 1
+    lines.append(f"{len(euronics_rows)} checked.")
+    lines += [f"- {_md_cell(k)}: {v}" for k, v in sorted(counts.items(), key=lambda kv: -kv[1])]
+    lines += ["", "## What this checks", "",
+              "- Google AI Mode and Gemini shop from the Merchant Center feed and the page's "
+              "structured data; ChatGPT and Perplexity read the page itself.",
+              "- Per product: title and meta description (as the product-copy job), brand, GTIN, "
+              "MPN, price, stock, energy rating and dimensions where relevant, the Product JSON-LD "
+              "against the catalogue, and the og:image (as the share-preview job).",
+              "- Scores are the share of sampled products with no issue in that area.", ""]
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def job_ai_readiness(args) -> JobResult:
+    spec = JOBS["ai-readiness"]
+    base = dict(job=spec.name, title=spec.title, desk=spec.desk, level=spec.level)
+    try:
+        api = load_api_config(Path(args.config))
+    except ConfigError as exc:
+        return JobResult(**base, status="NEEDS_YOU", summary=f"Not configured: {exc}.",
+                         next_step='Add "magento_api": {"config_ini": "<path to lunneys-scripts '
+                                   'config.ini>"} to ~/.agent-office/config.json.')
+    if not args.live:
+        return JobResult(**base, status="NEEDS_YOU",
+                         summary="Ready: run it live (read-only API and public pages).",
+                         next_step="python -m office.jobs run ai-readiness --live")
+    pace = _Pacer(args.delay)
+    try:
+        products = fetch_catalogue(api)
+        brands = attribute_labels(api, "brand")
+        energy = attribute_labels(api, "energy_rating")
+    except Exception as exc:
+        return JobResult(**base, status="ERROR", live=True,
+                         summary=f"Could not read products: {str(exc)[:200]}")
+    if not products:
+        return JobResult(**base, status="ERROR", live=True, summary="The API returned no products.")
+    sample, euronics = pick_ai_sample(products, args.sample, args.seed or datetime.now().strftime("%Y-%m-%d"))
+    deadline = time.monotonic() + args.max_minutes * 60
+    rows, euronics_rows = [], []
+    for p in sample + euronics:
+        if time.monotonic() > deadline:
+            break
+        raw = str(p.get("brand") or "").strip()
+        p = {**p, "brand_label": brands.get(raw, "") if brands else raw,
+             "energy_label": energy.get(str(p.get("energy_rating") or ""), "") if energy
+             else p.get("energy_rating"),
+             "in_stock": stock_status(api, p.get("sku"))}
+        (euronics_rows if _is_euronics(p) else rows).append(audit_ai_product(p, pace))
+    site_problems, site_lines, alert = [], [], False
+    try:
+        status, robots = _paced_page(f"{SITE}/robots.txt", pace, 20.0)
+        if status == 200:
+            blocked, others = check_ai_crawlers(robots, rows[0]["url"] if rows and rows[0]["url"] else SITE + "/")
+            alert = bool(blocked)
+            site_problems += [f"robots.txt blocks {a}" for a in blocked]
+            site_lines.append("robots.txt: " + ("blocks " + ", ".join(blocked) if blocked else
+                                                f"all {len(AI_CRAWLERS)} AI and search crawlers checked "
+                                                "may fetch product pages"))
+            if others:
+                site_lines.append("Also blocked (training or scraping only; not used for shopping "
+                                  "answers): " + ", ".join(others))
+        else:
+            site_problems.append(f"robots.txt not readable (HTTP {status})")
+            site_lines.append(site_problems[-1])
+        status, llms = _paced_page(f"{SITE}/llms.txt", pace, 20.0)
+        problems = check_llms(status, llms)
+        site_problems += problems
+        site_lines.append("llms.txt: " + ("; ".join(problems) if problems else
+                                          f"present ({len(llms.encode('utf-8'))} bytes)"))
+    except Exception as exc:
+        site_problems.append(f"site checks failed: {str(exc)[:120]}")
+        site_lines.append(site_problems[-1])
+    robots_ok = not any(p.startswith("robots") or p.startswith("site checks") for p in site_problems)
+    llms_ok = not any("llms" in p or p.startswith("site checks") for p in site_problems)
+    site = {"passed": robots_ok + llms_ok, "score": 50 * (robots_ok + llms_ok), "lines": site_lines}
+    scores = ai_scores(rows)
+    parts = [round(100 * c / n) for c, n in scores.values() if n] + [site["score"]]
+    overall = round(sum(parts) / len(parts))
+    fixes = top_ai_fixes(rows, site_problems)
+    stopped = len(rows) + len(euronics_rows) < len(sample) + len(euronics)
+    note = (f"Stopped early at the {args.max_minutes}-minute limit." if stopped else "")
+    intray = Path(args.intray)
+    intray.mkdir(parents=True, exist_ok=True)
+    csv_path, md_path = intray / "ai-readiness.csv", intray / "ai-readiness.md"
+    import csv
+    with csv_path.open("w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=AI_CSV_FIELDS)
+        writer.writeheader()
+        for r in rows + euronics_rows:
+            record = {"group": "Euronics (not scored)" if r["euronics"] else "scored",
+                      "sku": r["sku"], "name": r["name"], "url": r["url"], "page": r["page"],
+                      "issues": sum(len(v or []) for v in r["issues"].values())}
+            record.update({a.lower().replace(" ", "_"): _issue_text(r["issues"][a]) for a in AI_AREAS})
+            writer.writerow({k: _csv_safe(v) for k, v in record.items()})
+    _write_ai_markdown(md_path, rows, euronics_rows, scores, site, fixes, overall,
+                       sum(1 for p in products if not _is_euronics(p)), note)
+    area_line = ", ".join(f"{a.lower()} {round(100 * c / n) if n else '-'}" for a, (c, n) in scores.items())
+    findings = ([note] if note else []) + [f"Scores: {area_line}, crawler access {site['score']}."]
+    findings += [f"Fix {i}: {f['area']}: {f['issue']} ({f['count']} product(s))"
+                 if f["skus"] else f"Fix {i}: {f['issue']} (site-wide)" for i, f in enumerate(fixes[:5], 1)]
+    findings += [f"Euronics agency items: {len(euronics_rows)} checked, reported separately.",
+                 f"Report: {md_path}", f"Full list: {csv_path}"]
+    return JobResult(**base, live=True, status="ALERT" if alert else ("NEEDS_YOU" if fixes else "OK"),
+                     findings=findings,
+                     summary=f"AI shopping readiness {overall}/100 across {len(rows)} sampled products.",
+                     next_step=("robots.txt blocks an AI crawler: check it first. " if alert else "")
+                     + ("Work down the top fixes in the report." if fixes else ""))
+
+
 # ── Reviews.io replies ────────────────────────────────────────────────────────
 
 REPLY_RULES = [
@@ -1185,6 +1727,7 @@ RUNNERS = {
     "backup-check": job_backup_check,
     "share-preview": job_share_preview,
     "product-copy": job_product_copy,
+    "ai-readiness": job_ai_readiness,
     "crontab-guard": job_crontab_guard,
     "morning-briefing": job_morning_briefing,
     "social-batch": job_social_batch,
@@ -1232,9 +1775,13 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--input", default=None, help="reviews JSON for reviews-replies")
     run.add_argument("--url", default=None, help="the loshop.co.uk link for share-preview")
     run.add_argument("--delay", type=float, default=2.0,
-                     help="seconds between page fetches in the category-images audit")
+                     help="seconds between page fetches (category-images, ai-readiness)")
     run.add_argument("--max-minutes", type=_positive_int, default=50,
-                     help="time limit for the category-images audit")
+                     help="time limit for the category-images and ai-readiness audits")
+    run.add_argument("--sample", type=_positive_int, default=40,
+                     help="products to sample in ai-readiness (plus a quarter as many Euronics items)")
+    run.add_argument("--seed", default=None,
+                     help="ai-readiness sample seed (default: today's date, so a rerun repeats it)")
     run.add_argument("--relay-db", default="relay.db")
     run.add_argument("--a2a-db", default="a2a.db")
     args = parser.parse_args(argv)

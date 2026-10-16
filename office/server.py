@@ -43,6 +43,7 @@ BUTTONS: dict[str, list[tuple[str, bool]]] = {
     "backup-check": [("Run live", True)],
     "share-preview": [("Check link", True)],
     "product-copy": [("Run live", True)],
+    "ai-readiness": [("Run live", True)],
     "crontab-guard": [("Run live", True)],
     "morning-briefing": [("Run", False), ("Run live", True)],
     "social-batch": [("Run", False)],
@@ -51,7 +52,8 @@ BUTTONS: dict[str, list[tuple[str, bool]]] = {
 }
 LIVE_JOBS = frozenset(job for job, buttons in BUTTONS.items() if any(live for _, live in buttons))
 JOB_TIMEOUT = 900                                 # seconds
-JOB_TIMEOUTS = {"category-images": 3600}          # the audit fetches ~260 pages
+JOB_TIMEOUTS = {"category-images": 3600,          # the audit fetches ~260 pages
+                "ai-readiness": 3600}             # ~100 pages and images, 2 s apart
 MAX_BODY = 4096
 SECURITY_HEADERS = {
     "Content-Security-Policy": ("default-src 'none'; style-src 'unsafe-inline'; "

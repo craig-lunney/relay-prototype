@@ -364,3 +364,281 @@ def test_free_delivery_is_fine_except_on_euronics_items():
     assert jobs.check_product_copy(_p(meta_description=meta)) == []
     assert jobs.check_product_copy(_p(meta_description=meta, is_euronics="0")) == []
     assert [i for i, _ in jobs.check_product_copy(_p(meta_description=meta, is_euronics="1"))] ==         ["promise to check"]
+
+
+# ── AI shopping readiness ─────────────────────────────────────────────────────
+
+LIVE_ROBOTS = """User-agent: Amazonbot
+Allow: /
+
+User-agent: Applebot-Extended
+Disallow: /
+
+User-agent: Bytespider
+Disallow: /
+
+User-agent: ClaudeBot
+Allow: /
+
+User-agent: GPTBot
+Allow: /
+
+User-agent: Googlebot
+Disallow:
+
+User-agent: *
+Disallow: /admin/
+Disallow: /checkout/
+
+Sitemap: https://loshop.co.uk/sitemap.xml
+"""
+LLMS = "# Lunneys Electrical\n\n> Family-run appliance retailer since 1967.\n\n" + "About us. " * 30
+
+
+def _ai(**kw):
+    base = {"sku": "BMN3WT3841S", "name": "Beko BMN3WT3841S 8kg Washing Machine - Silver",
+            "type_id": "simple", "price": 329, "url_key": "beko-bmn3wt3841s", "visibility": 4,
+            "meta_title": "Beko BMN3WT3841S", "meta_description": "Beko 8kg washing machine.",
+            "description": "<p>A freestanding washing machine.</p>", "short_description": "",
+            "brand_label": "Beko", "ean": "8690842690662", "mpn": "BMN3WT3841S", "energy_label": "A",
+            "height": "84.5", "width": "60", "depth": "54.6", "in_stock": True,
+            "is_euronics": "0", "googleshopping_exclude": "0"}
+    return {**base, **kw}
+
+
+def _ld(**offer):
+    good = {"@type": "Offer", "price": "329.00", "availability": "https://schema.org/InStock",
+            "shippingDetails": {"shippingRate": {"value": 0, "currency": "GBP"},
+                                "shippingDestination": {"addressCountry": "GB"}}}
+    return {"@context": "https://schema.org", "@type": "Product", "name": "Beko BMN3WT3841S",
+            "brand": {"@type": "Brand", "name": "Beko"}, "gtin13": "8690842690662",
+            "aggregateRating": {"ratingValue": 4.8, "reviewCount": 12},
+            "offers": {k: v for k, v in {**good, **offer}.items() if v is not None}}
+
+
+def _page(ld, image="https://loshop.co.uk/media/catalog/product/b/m/bmn.jpg"):
+    return (f'<html><head><title>Beko</title><meta property="og:title" content="Beko">'
+            f'<meta property="og:description" content="8kg washer">'
+            f'<meta property="og:image" content="{image}">'
+            f'<script type="application/ld+json">{json.dumps(ld, indent=2)}</script></head></html>')
+
+
+@pytest.mark.parametrize("code,ok", [("8690842690662", True), ("6901101815507", True),
+                                     ("8690842644450", True), ("8690842690663", False),
+                                     ("869084269066", False), ("ABC", False), ("", False),
+                                     ("96385074", True)])
+def test_gtin_check_digit(code, ok):
+    assert jobs.gtin_ok(code) is ok
+
+
+def test_complete_product_has_no_attribute_issues():
+    assert jobs.check_attributes(_ai()) == []
+
+
+@pytest.mark.parametrize("product,issue", [
+    (_ai(brand_label=" "), "no brand"),
+    (_ai(ean=""), "no GTIN"),
+    (_ai(ean="8690842690663"), "GTIN invalid"),
+    (_ai(mpn="  "), "no MPN"),
+    (_ai(mpn="BMN3WY3841S"), "MPN does not match model"),   # seen live, 2026-10-16
+    (_ai(price=0), "no price"),
+    (_ai(in_stock=None), "no stock record"),
+    (_ai(energy_label=""), "no energy rating"),
+    (_ai(depth=""), "no dimensions"),
+    (_ai(googleshopping_exclude="1"), "excluded from Google Shopping"),
+])
+def test_attribute_issues(product, issue):
+    assert issue in [i for i, _ in jobs.check_attributes(product)]
+
+
+def test_attribute_checks_avoid_false_alarms():
+    # energy rating and size only where they apply; a Euronics item is meant to be excluded;
+    # a configurable product has no price of its own; spec_* sizes count as dimensions
+    for name in ("Hotpoint Washing Machine Hose Kit", "Morphy Richards Slow Cooker 6.5L",
+                 "Philips Hair Dryer"):
+        assert jobs.check_attributes(_ai(name=name, sku="ACC1", mpn="ACC1", energy_label="",
+                                         depth="")) == []
+    assert jobs.check_attributes(_ai(googleshopping_exclude="1", is_euronics="1")) == []
+    assert jobs.check_attributes(_ai(type_id="configurable", price=0)) == []
+    assert jobs.check_attributes(_ai(height="", width="", depth="", spec_height="85 cm",
+                                     spec_width="60 cm", spec_depth="55 cm")) == []
+    assert "no energy rating" not in [i for i, _ in jobs.check_attributes(
+        _ai(energy_label="", euronics_energy_label="<a href=x>label</a>"))]
+    assert "no dimensions" in [i for i, _ in jobs.check_attributes(
+        _ai(name="Panasonic Microwave 25L", sku="NN1", mpn="NN1", depth=""))]
+
+
+def test_product_ld_finds_the_product_node():
+    product = {"@type": ["Product", "Thing"], "name": "X"}
+    pages = ['<script type="application/ld+json">{not json</script>'
+             f'<script type="application/ld+json">{json.dumps({"@type": "BreadcrumbList"})}</script>'
+             f'<script type="application/ld+json">{json.dumps(product)}</script>',
+             f'<script type="application/ld+json">{json.dumps({"@graph": [{"@type": "WebSite"}, product]})}</script>',
+             f'<SCRIPT TYPE="application/ld+json">{json.dumps([product])}</SCRIPT>']
+    for page in pages:
+        assert jobs.product_ld(page) == product
+    assert jobs.product_ld("<html></html>") is None
+
+
+def test_good_structured_data_passes():
+    assert jobs.check_structured_data(_ld(), _ai()) == []
+
+
+@pytest.mark.parametrize("ld,product,issue", [
+    (None, _ai(), "no Product JSON-LD"),
+    ({**_ld(), "brand": {"@type": "Brand"}}, _ai(), "JSON-LD: no brand"),
+    ({k: v for k, v in _ld().items() if k != "gtin13"}, _ai(), "JSON-LD: no GTIN"),
+    ({k: v for k, v in _ld().items() if k != "offers"}, _ai(), "JSON-LD: no offer"),
+    (_ld(price=None), _ai(), "JSON-LD: no price"),
+    (_ld(price="349.00"), _ai(), "JSON-LD: price differs from catalogue"),
+    (_ld(availability=None), _ai(), "JSON-LD: no availability"),
+    (_ld(), _ai(in_stock=False), "JSON-LD: availability differs from stock"),
+    (_ld(shippingDetails=None), _ai(), "JSON-LD: no delivery info"),
+    (_ld(), _ai(is_euronics="1"), "JSON-LD: free delivery on a Euronics item"),
+    (_ld(), _ai(ni_delivery_only="1"), "JSON-LD: delivery area too wide"),
+    ({k: v for k, v in _ld().items() if k != "aggregateRating"}, _ai(), "JSON-LD: no rating"),
+])
+def test_structured_data_issues(ld, product, issue):
+    assert issue in [i for i, _ in jobs.check_structured_data(ld, product)]
+
+
+def test_structured_data_accepts_special_price_and_regional_delivery():
+    assert jobs.check_structured_data(_ld(price="299"), _ai(special_price="299.0000")) == []
+    regional = _ld(shippingDetails={"shippingRate": {"value": 30},
+                                    "shippingDestination": {"addressCountry": "GB", "addressRegion": "NIR"}})
+    assert jobs.check_structured_data(regional, _ai(ni_delivery_only="1", is_euronics="1")) == []
+    assert jobs.check_structured_data(_ld(availability="https://schema.org/OutOfStock"),
+                                      _ai(in_stock=False)) == []
+
+
+def test_ai_crawlers_in_the_live_robots_file_are_allowed():
+    blocked, others = jobs.check_ai_crawlers(LIVE_ROBOTS, "https://loshop.co.uk/beko.html")
+    assert blocked == [] and others == ["Applebot-Extended", "Bytespider"]
+
+
+def test_a_blocked_ai_crawler_is_found():
+    robots = LIVE_ROBOTS.replace("User-agent: GPTBot\nAllow: /", "User-agent: GPTBot\nDisallow: /")
+    robots += "\nUser-agent: PerplexityBot\nDisallow: /\n"
+    blocked, _ = jobs.check_ai_crawlers(robots, "https://loshop.co.uk/beko.html")
+    assert blocked == ["GPTBot", "PerplexityBot"]
+    assert jobs.check_ai_crawlers("User-agent: *\nDisallow: /\n")[0] == jobs.AI_CRAWLERS
+
+
+@pytest.mark.parametrize("status,text,needle", [
+    (404, "", "not found"), (200, "<html>One moment</html>", "web page"),
+    (200, "Lunneys " * 40, "'# ' title"), (200, "# Lunneys\n", "very short")])
+def test_llms_txt_problems(status, text, needle):
+    assert any(needle in p for p in jobs.check_llms(status, text))
+
+
+def test_llms_txt_present():
+    assert jobs.check_llms(200, LLMS) == []
+
+
+def test_fetch_catalogue_asks_for_enabled_visible_products():
+    seen = []
+
+    def get(path):
+        seen.append(path)
+        return {"items": [{"sku": "a", "name": "A", "price": 5, "visibility": 4, "custom_attributes": [
+                    {"attribute_code": "ean", "value": "123"}]},
+                          {"sku": "h", "name": "H", "visibility": 1}], "total_count": 2}
+    products = jobs.fetch_catalogue({"base": "x", "token": "t"}, get=get)
+    assert [p["sku"] for p in products] == ["a"] and products[0]["ean"] == "123"
+    assert seen[0].startswith("/rest/all/V1/products?") and "conditionType%5D=neq" in seen[0]
+
+
+def test_sample_is_repeatable_and_keeps_euronics_apart():
+    products = [_ai(sku=f"S{i}", is_euronics="1" if i % 3 == 0 else "0") for i in range(60)]
+    scored, euronics = jobs.pick_ai_sample(products, 8, "2026-10-16")
+    assert len(scored) == 8 and len(euronics) == 5
+    assert not any(jobs._is_euronics(p) for p in scored) and all(jobs._is_euronics(p) for p in euronics)
+    assert jobs.pick_ai_sample(products, 8, "2026-10-16") == (scored, euronics)
+
+
+def test_top_fixes_rank_by_weight_times_products():
+    rows = [{"sku": str(i), "issues": {"Structured data": [("JSON-LD: no rating", "")],
+                                       "Key attributes": [("no GTIN", "")] if i < 2 else []}}
+            for i in range(5)]
+    fixes = jobs.top_ai_fixes(rows, ["robots.txt blocks GPTBot"])
+    assert [f["issue"] for f in fixes] == ["robots.txt blocks GPTBot", "no GTIN", "JSON-LD: no rating"]
+    assert fixes[1]["count"] == 2 and fixes[1]["skus"] == ["0", "1"]
+
+
+def _ai_config(tmp_path):
+    ini = tmp_path / "scripts.ini"
+    ini.write_text("[magento]\nbase_url = https://loshop.co.uk\ntoken = SECRET-TOKEN\n", encoding="utf-8")
+    config = tmp_path / "c.json"
+    config.write_text(json.dumps({"magento_api": {"config_ini": str(ini)}}), encoding="utf-8")
+    return config
+
+
+def test_ai_readiness_needs_config_and_live(tmp_path):
+    _, result, _ = _run(tmp_path, "run", "ai-readiness", "--live")
+    assert result["status"] == "NEEDS_YOU" and "Not configured" in result["summary"]
+    _, result, _ = _run(tmp_path, "run", "ai-readiness", config=_ai_config(tmp_path))
+    assert result["status"] == "NEEDS_YOU" and "--live" in result["next_step"]
+
+
+def _fake_site(monkeypatch, pages, catalogue):
+    monkeypatch.setattr(jobs, "_fetch_bytes", lambda url, limit=0: (200, "image/png", _png(1200, 630)))
+    catalogue = [{**p, "brand": "220", "energy_rating": "337"} for p in catalogue]
+    monkeypatch.setattr(jobs, "fetch_catalogue", lambda api: catalogue)
+    labels = {"brand": {"220": "Beko"}, "energy_rating": {"337": "A"}}
+    monkeypatch.setattr(jobs, "attribute_labels", lambda api, code: labels[code])
+    monkeypatch.setattr(jobs, "stock_status", lambda api, sku: True)
+
+
+def test_ai_readiness_job_writes_report_and_csv(tmp_path, monkeypatch):
+    catalogue = [_ai(sku="GOOD1", url_key="good1"),
+                 _ai(sku="=BMN3WT3841S", name="=HYPERLINK(1) Beko BMN3WT3841S Washing Machine",
+                     url_key="bad2", ean="",
+                     mpn="BMN3WY3841S"),
+                 _ai(sku="EUR1", url_key="eur1", is_euronics="1", googleshopping_exclude="1",
+                     ni_delivery_only="1", ean="")]
+    no_rating = {k: v for k, v in _ld().items() if k != "aggregateRating"}
+    pages = {"https://loshop.co.uk/good1.html": _page(_ld()),
+             "https://loshop.co.uk/bad2.html": _page(no_rating,
+                                                     image="https://loshop.co.uk/media/logo/stores/1/logo.png"),
+             "https://loshop.co.uk/eur1.html": _page(_ld()),
+             "https://loshop.co.uk/robots.txt": LIVE_ROBOTS, "https://loshop.co.uk/llms.txt": LLMS}
+    fetched, sleeps = [], []
+    bot_once = {"https://loshop.co.uk/good1.html"}
+
+    def fake_fetch(url, limit=0):
+        fetched.append(url)
+        if url in bot_once:                         # the host's bot check answers once
+            bot_once.discard(url)
+            return 200, "<html><title>One moment, please...</title></html>"
+        return (200, pages[url]) if url in pages else (404, "")
+    monkeypatch.setattr(jobs, "_fetch", fake_fetch)
+    monkeypatch.setattr(jobs.time, "sleep", sleeps.append)
+    _fake_site(monkeypatch, pages, catalogue)
+    code, result, intray = _run(tmp_path, "run", "ai-readiness", "--live", "--delay", "0",
+                                "--sample", "5", config=_ai_config(tmp_path))
+    assert code == 0 and result["status"] == "NEEDS_YOU", result
+    assert result["summary"].startswith("AI shopping readiness ") and "across 2 sampled" in result["summary"]
+    assert sleeps == [20.0] and fetched.count("https://loshop.co.uk/good1.html") == 2
+    md = (intray / "ai-readiness.md").read_text(encoding="utf-8")
+    assert "| Key attributes | 50 | 1 of 2 products |" in md and "| Crawler access (site) | 100 |" in md
+    assert "Key attributes: no GTIN** (1 of 2 products)" in md
+    assert "Key attributes: MPN does not match model" in md
+    assert "Share image: share image is the store logo" in md
+    assert "Applebot-Extended" in md and "llms.txt: present" in md
+    euronics = md.split("## Euronics agency items")[1]
+    assert "JSON-LD: free delivery on a Euronics item: 1" in euronics and "no GTIN: 1" in euronics
+    text = (intray / "ai-readiness.csv").read_text(encoding="utf-8")
+    assert "'=HYPERLINK" in text and "'=BMN3WT3841S" in text and "Euronics (not scored)" in text
+    assert "SECRET-TOKEN" not in text + md + json.dumps(result)
+
+
+def test_ai_readiness_alerts_when_robots_blocks_an_ai_crawler(tmp_path, monkeypatch):
+    pages = {"https://loshop.co.uk/good1.html": _page(_ld()),
+             "https://loshop.co.uk/robots.txt": LIVE_ROBOTS + "\nUser-agent: OAI-SearchBot\nDisallow: /\n"}
+    monkeypatch.setattr(jobs, "_fetch", lambda url, limit=0: (200, pages[url]) if url in pages else (404, ""))
+    _fake_site(monkeypatch, pages, [_ai(sku="GOOD1", url_key="good1")])
+    code, result, _ = _run(tmp_path, "run", "ai-readiness", "--live", "--delay", "0",
+                           config=_ai_config(tmp_path))
+    assert code == 1 and result["status"] == "ALERT"
+    assert any("robots.txt blocks OAI-SearchBot" in f for f in result["findings"])
+    assert any("/llms.txt not found" in f for f in result["findings"])
