@@ -120,6 +120,9 @@ verification, the worker's diff, the commands and their output). A successful
 run ends in `ACCEPTANCE_REQUIRED`: the sample's numeric criteria are yours to
 check and acknowledge.
 
+The v1 real run (2026-10-16) is recorded in
+[docs/acceptance/real-run-2026-10-16.md](docs/acceptance/real-run-2026-10-16.md).
+
 ## The office: dashboard and in-tray
 
 ```bash
