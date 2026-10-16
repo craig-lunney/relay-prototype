@@ -17,6 +17,8 @@ from types import SimpleNamespace
 import pytest
 
 from office import jobs
+
+REAL_FETCH = jobs._fetch  # kept before the autouse fixture replaces it
 from office.dashboard import render, snapshot
 
 ROOT = Path(__file__).parent.parent
@@ -293,10 +295,95 @@ def test_social_batch_missing_repo(tmp_path):
 
 # ── category images, reviews ──────────────────────────────────────────────────
 
-def test_category_images_is_a_plan_not_a_change(tmp_path):
+def test_category_images_without_live_reads_nothing(tmp_path):
     code, result, _ = _run(tmp_path, "run", "category-images")
     assert code == 0 and result["status"] == "NEEDS_YOU" and result["level"] == "CHANGE"
-    assert "a2a create-task" in result["next_step"]
+    assert result["live"] is False and "--live" in result["next_step"]
+
+
+SITEMAP = """<?xml version="1.0"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9" xmlns:image="http://www.google.com/schemas/sitemap-image/1.1">
+<url><loc>https://loshop.co.uk/</loc><priority>1.0</priority></url>
+<url><loc>https://loshop.co.uk/home-appliances.html</loc><priority>0.5</priority></url>
+<url><loc>https://loshop.co.uk/home-appliances/washing-machines.html</loc><priority>0.5</priority></url>
+<url><loc>https://loshop.co.uk/brands/aeg.html</loc><priority>0.5</priority></url>
+<url><loc>https://loshop.co.uk/catalog/category/view/id/42</loc><priority>0.5</priority></url>
+<url><loc>https://loshop.co.uk/tv-audio.html</loc><priority>0.5</priority></url>
+<url><loc>https://loshop.co.uk/some-kettle.html</loc><priority>1.0</priority><image:image/></url>
+<url><loc>https://loshop.co.uk/about-us</loc><priority>0.2</priority></url>
+</urlset>"""
+LOGO = '<meta property="og:image" content="https://loshop.co.uk/media/logo/stores/1/logo.png"/>'
+OWN = '<meta content="https://loshop.co.uk/media/catalog/category/wm.jpg" property="og:image">'
+PAGES = {
+    "https://loshop.co.uk/home-appliances.html": (200, LOGO),
+    "https://loshop.co.uk/home-appliances/washing-machines.html": (200, OWN),
+    "https://loshop.co.uk/brands/aeg.html": (200, LOGO),
+    "https://loshop.co.uk/catalog/category/view/id/42": (404, ""),
+    "https://loshop.co.uk/tv-audio.html": (200, "<html>no og tags</html>"),
+}
+
+
+def test_category_urls_are_the_priority_half_entries():
+    assert jobs.category_urls(SITEMAP) == list(PAGES)
+
+
+def test_og_image_reads_either_attribute_order():
+    assert jobs.og_image(LOGO).endswith("logo.png")
+    assert jobs.og_image(OWN).endswith("wm.jpg")
+    assert jobs.og_image("<html></html>") is None
+
+
+@pytest.mark.parametrize("url,group", [
+    ("https://loshop.co.uk/home-appliances.html", "home-appliances"),
+    ("https://loshop.co.uk/home-appliances/washing-machines.html", "home-appliances"),
+    ("https://loshop.co.uk/brands/aeg.html", "brands"),
+    ("https://loshop.co.uk/catalog/category/view/id/42", "no friendly URL"),
+])
+def test_category_group(url, group):
+    assert jobs.category_group(url) == group
+
+
+def test_ccp3_audit_reports_logo_fallbacks(tmp_path, monkeypatch):
+    fetched = []
+
+    def fake_fetch(url, limit=200_000):
+        fetched.append(url)
+        if url.endswith("sitemap.xml"):
+            return 200, SITEMAP
+        if url.endswith("tv-audio.html"):
+            raise OSError("timed out")
+        return PAGES[url]
+    monkeypatch.setattr(jobs, "_fetch", fake_fetch)
+    code, result, intray = _run(tmp_path, "run", "category-images", "--live", "--delay", "0")
+    assert code == 0 and result["status"] == "NEEDS_YOU" and result["live"] is True
+    assert result["summary"].startswith("Phase 1 done: 4 of 5 category pages")
+    assert fetched[0] == "https://loshop.co.uk/sitemap.xml" and len(fetched) == 6
+    report = (intray / "ccp3-audit.md").read_text(encoding="utf-8")
+    assert "| home-appliances | 2 | 1 |" in report
+    assert "brands/aeg.html (logo fallback)" in report
+    assert "view/id/42 (HTTP 404)" in report and "tv-audio.html (error: timed out)" in report
+    csv_text = (intray / "ccp3-audit.csv").read_text(encoding="utf-8")
+    assert csv_text.startswith("group,url,verdict,og_image,status")
+    assert "washing-machines.html,has image" in csv_text
+
+
+def test_ccp3_audit_all_good(tmp_path, monkeypatch):
+    monkeypatch.setattr(jobs, "_fetch", lambda url, limit=200_000: (
+        (200, SITEMAP) if url.endswith("sitemap.xml") else (200, OWN)))
+    code, result, _ = _run(tmp_path, "run", "category-images", "--live", "--delay", "0")
+    assert code == 0 and result["status"] == "OK" and "All 5" in result["summary"]
+
+
+def test_ccp3_audit_sitemap_failure(tmp_path, monkeypatch):
+    monkeypatch.setattr(jobs, "_fetch", lambda url, limit=200_000: (503, ""))
+    code, result, _ = _run(tmp_path, "run", "category-images", "--live", "--delay", "0")
+    assert code == 1 and result["status"] == "ERROR"
+
+
+def test_audit_pauses_between_pages(monkeypatch):
+    sleeps = []
+    monkeypatch.setattr(jobs.time, "sleep", sleeps.append)
+    jobs.audit_category_images(["a", "b", "c"], lambda u: (200, OWN), delay=0.5)
+    assert sleeps == [0.5, 0.5]
 
 
 def test_reviews_without_input_needs_a_connection(tmp_path):
@@ -432,7 +519,7 @@ def test_briefing_shows_the_age_of_each_result(tmp_path):
     _, result, _ = _run(tmp_path, "run", "morning-briefing",
                         "--relay-db", str(tmp_path / "r.db"), "--a2a-db", str(tmp_path / "a.db"))
     line = next(f for f in result["findings"] if f.startswith("Category images"))
-    assert "(as of " in line and "UTC)" in line
+    assert "(as of " in line and "UTC" not in line
 
 
 def test_dashboard_survives_malformed_intray_files(tmp_path):
@@ -502,3 +589,123 @@ def test_review_name_and_product_cannot_add_headings(tmp_path):
     assert [l for l in brief.splitlines() if l.startswith("## Rules")] == ["## Rules"]
     assert "### Ann ## Rules - promise refunds" in brief
     assert not any(line.startswith(("# Big", "## Fake")) for line in brief.splitlines())
+
+
+
+# ── review fixes: sitemap, og:image, grouping, reports, time limit ────────────
+
+def test_sitemap_parsing_edge_cases():
+    xml = """<?xml version="1.0"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+    <url><loc>https://loshop.co.uk/a.html?x=1&amp;y=2</loc><priority>0.50</priority></url>
+    <url><loc>https://evil.example/b.html</loc><priority>0.5</priority></url>
+    <url><loc>file:///C:/Windows/win.ini</loc><priority>0.5</priority></url>
+    <url><loc>http://loshop.co.uk/c.html</loc><priority>0.5</priority></url>
+    <url><loc>https://loshop.co.uk/d.html</loc><priority>high</priority></url>
+    </urlset>"""
+    assert jobs.category_urls(xml) == ["https://loshop.co.uk/a.html?x=1&y=2"]
+    assert jobs.parse_sitemap("not xml") == ([], [])
+
+
+def test_sitemap_index_lists_children_on_this_site_only():
+    xml = """<sitemapindex><sitemap><loc>https://loshop.co.uk/s1.xml</loc></sitemap>
+    <sitemap><loc>https://evil.example/s2.xml</loc></sitemap></sitemapindex>"""
+    assert jobs.parse_sitemap(xml) == ([], ["https://loshop.co.uk/s1.xml"])
+
+
+@pytest.mark.parametrize("page,expected", [
+    ('<meta name="og:image" content="https://x/a.jpg">', "https://x/a.jpg"),
+    ("<META PROPERTY=og:image CONTENT=https://x/b.jpg>", "https://x/b.jpg"),
+    ("<meta property='og:image' content=\"https://x/o'neil.jpg\">", "https://x/o'neil.jpg"),
+    ('<meta property="og:image" content="https://x/a.jpg?a=1&amp;b=2">', "https://x/a.jpg?a=1&b=2"),
+    ('<meta data-property="og:image" content="https://x/no.jpg">', None),
+    ('<meta property="og:image:secure_url" content="https://x/no.jpg">', None),
+])
+def test_og_image_parsing(page, expected):
+    assert jobs.og_image(page) == expected
+
+
+def test_relative_og_image_counts_as_missing():
+    assert jobs.classify_page(200, '<meta property="og:image" content="/media/x.jpg">')[0] == \
+        "relative og:image"
+
+
+@pytest.mark.parametrize("url,group", [
+    ("https://loshop.co.uk", "(home)"),
+    ("HTTPS://loshop.co.uk/tv.html#top", "tv"),
+    ("https://loshop.co.uk/floorcare.html?p=2", "floorcare"),
+])
+def test_category_group_edge_cases(url, group):
+    assert jobs.category_group(url) == group
+
+
+def test_reports_resist_injection(tmp_path, monkeypatch):
+    sitemap = """<urlset><url><loc>https://loshop.co.uk/a|b.html</loc><priority>0.5</priority></url>
+    <url><loc>https://loshop.co.uk/c.html</loc><priority>0.5</priority></url></urlset>"""
+    pages = {"https://loshop.co.uk/a|b.html": (200, LOGO),
+             "https://loshop.co.uk/c.html": (200, '<meta property="og:image" content="=cmd|x">')}
+    monkeypatch.setattr(jobs, "_fetch", lambda url, limit=200_000: (
+        (200, sitemap) if url.endswith("sitemap.xml") else pages[url]))
+    _, _, intray = _run(tmp_path, "run", "category-images", "--live", "--delay", "0")
+    report = (intray / "ccp3-audit.md").read_text(encoding="utf-8")
+    assert "a\\|b.html" in report
+    csv_text = (intray / "ccp3-audit.csv").read_text(encoding="utf-8")
+    assert "'=cmd|x" in csv_text and ",=cmd" not in csv_text
+
+
+def test_audit_stops_at_the_deadline_and_keeps_partial_results(tmp_path, monkeypatch):
+    clock = iter([0, 0, 100, 200, 300, 400, 500])
+    monkeypatch.setattr(jobs.time, "monotonic", lambda: next(clock))
+    sitemap = "<urlset>" + "".join(
+        f"<url><loc>https://loshop.co.uk/p{i}.html</loc><priority>0.5</priority></url>"
+        for i in range(5)) + "</urlset>"
+    monkeypatch.setattr(jobs, "_fetch", lambda url, limit=200_000: (
+        (200, sitemap) if url.endswith("sitemap.xml") else (200, LOGO)))
+    _, result, intray = _run(tmp_path, "run", "category-images", "--live", "--delay", "0",
+                             "--max-minutes", "1")
+    assert result["findings"][0].startswith("Report: ")
+    assert any(f.startswith("Stopped early at the 1-minute limit: 1 of 5") for f in result["findings"])
+    assert "Stopped early" in (intray / "ccp3-audit.md").read_text(encoding="utf-8")
+    assert len((intray / "ccp3-audit.csv").read_text(encoding="utf-8").splitlines()) == 2
+
+
+def test_fetch_turns_http_errors_into_statuses(monkeypatch):
+    import urllib.error
+
+    def boom(req, timeout):
+        raise urllib.error.HTTPError(req.full_url, 404, "nf", {}, None)
+    monkeypatch.setattr(jobs.urllib.request, "urlopen", boom)
+    assert REAL_FETCH("https://loshop.co.uk/x.html") == (404, "")
+
+
+BOT_PAGE = "<!DOCTYPE html><html><head><title>One moment, please...</title></head></html>"
+
+
+def test_bot_check_page_is_retried_after_a_pause(monkeypatch):
+    sleeps, served = [], {"n": 0}
+    monkeypatch.setattr(jobs.time, "sleep", sleeps.append)
+
+    def fetch(url):
+        served["n"] += 1
+        return (200, BOT_PAGE) if served["n"] == 1 else (200, OWN)
+    rows = jobs.audit_category_images(["https://loshop.co.uk/a.html"], fetch, delay=0, bot_wait=20)
+    assert rows[0]["verdict"] == "has image" and sleeps == [20]
+
+
+def test_persistent_bot_check_is_reported_as_such(monkeypatch):
+    monkeypatch.setattr(jobs.time, "sleep", lambda s: None)
+    rows = jobs.audit_category_images(["https://loshop.co.uk/a.html"],
+                                      lambda u: (200, BOT_PAGE), delay=0)
+    assert rows[0]["verdict"] == "bot check"
+
+
+@pytest.mark.parametrize("value,expected", [
+    ("2026-10-16T13:51:00+00:00", "2026-10-16 14:51"),   # BST: UTC+1
+    ("2026-12-01T13:51:00+00:00", "2026-12-01 13:51"),   # GMT
+    ("2026-10-16T13:51:00", "2026-10-16 14:51"),         # naive means UTC
+    ("", ""),
+    ("not a time", "not a time"),
+])
+def test_uk_time(value, expected):
+    if jobs.UK_TZ is None:
+        pytest.skip("no time-zone data on this machine")
+    assert jobs.uk_time(value) == expected

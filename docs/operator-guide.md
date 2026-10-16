@@ -224,7 +224,7 @@ the latest result of every job. The exit code is 1 when a job's status is
 | `crontab-guard` | Report | `crontab -l` on your server; alerts if it has fewer lines than the baseline or if a required entry is missing or commented out. Extra lines are reported, not alerted. Server details come from the local config file below. | Read-only SSH, only with `--live` (key-based; `BatchMode`, so it never prompts). |
 | `morning-briefing` | Report | One page (`morning-briefing-YYYY-MM-DD.md`): what's waiting on you, every other job's latest result, and with `--live` the robots.txt guard (Googlebot rules, AI-crawler block, apex sitemap line, no query-string Disallow) and the sitemap. | HTTPS GET of two public URLs, only with `--live`. |
 | `social-batch` | Draft | Picks approved knowledge items (`LUNNEYS_APPROVED` + `APPROVED`) that have no approved visual yet, one per category first, and prints the `knowledge_run.py` commands. You approve at Gate 1 and Gate 2 as usual. `--social-repo`, `--count`. | None; reads the Lunneys Social folder. |
-| `category-images` | Change (plan only) | The CCP 3 job card and the `a2a create-task` command to start it as a T2 task. | None. |
+| `category-images` | Change (plan only) | CCP 3. With `--live`, Phase 1: reads `sitemap.xml`, takes the category pages (priority 0.5), fetches each one (2 s apart, `--delay`) and records whether its `og:image` is the store-logo fallback. Writes `ccp3-audit.md` and `ccp3-audit.csv` (rows written as they arrive). Stops at `--max-minutes` (50). If the host's "One moment, please" bot check answers, it waits 20 s and retries once, then reports `bot check`. Phase 2 (artwork, live changes) stays a plan for your approval. | HTTPS GET of `sitemap.xml` and every category page, only with `--live`; only `https://loshop.co.uk/` URLs are fetched. |
 | `reviews-replies` | Draft | With `--input reviews.json` (a list of `{name, rating, text, product}`), writes `reviews-reply-brief.md`: reply rules, reviews to draft, and anything rated 3 or below for you first. Posts nothing. | None. |
 
 The crontab guard reads its server details from `~/.agent-office/config.json`
@@ -246,6 +246,23 @@ repository:
 `ssh_options` may only set algorithm, key and known-hosts options; anything that
 could run a command (such as `ProxyCommand`) is refused. Without a config file the
 job reports "Not configured" and does nothing.
+
+### The office app
+
+```bash
+python -m office.server            # http://127.0.0.1:8765/ opens in your browser
+```
+
+The dashboard with a **Hand out a job** panel: one button per job. **Run** does
+the job's offline part; the orange **Run live** buttons read the live server or
+website. One job runs at a time and the page refreshes itself until it is done;
+the last job's output is shown on the page. Close the app's window to stop it.
+
+It is for this computer only: it listens on 127.0.0.1, refuses requests for any
+other host name, needs a code created at start-up on every button press (so
+another website cannot press them), cannot be framed and loads nothing from
+outside. A second copy cannot start on the same port. Times on every office
+page are UK time (GMT/BST); stored records stay in UTC.
 
 Run the live checks yourself the first time and read the output before you
 schedule them. Nothing in the office writes to the server, the website,

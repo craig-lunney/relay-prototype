@@ -26,12 +26,11 @@ import sqlite3
 import sys
 from contextlib import closing
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 from pathlib import Path
 
 from relay.state import GENESIS_HASH, event_hash
 
-from .jobs import DEFAULT_INTRAY, JOBS
+from .jobs import DEFAULT_INTRAY, JOBS, uk_time
 
 # Statuses that need the boss, with the command that resolves them.
 _RELAY_WAITING = {
@@ -251,13 +250,17 @@ def _pill(text) -> str:
     return f'<span class="pill" style="background:{colour}">{_e(text)}</span>'
 
 
-def render(snap: Snapshot, relay_db: Path, a2a_db: Path) -> str:
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+def render(snap: Snapshot, relay_db: Path, a2a_db: Path, controls: str = "",
+           refresh_seconds: int | None = None, subtitle: str = "Read-only snapshot") -> str:
+    """The dashboard page. `controls` is trusted HTML from office.server (already escaped)."""
+    now = uk_time() + " UK time"
     shipped = sum(1 for t in snap.a2a_tasks if t["state"] in ("SHIPPED", "CLOSED"))
     done = sum(1 for t in snap.relay_tasks if t["status"] == "COMPLETED")
+    refresh = (f'\n<meta http-equiv="refresh" content="{int(refresh_seconds)}">'
+               if refresh_seconds else "")
     parts = [f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Agent Office HQ — dashboard</title>
+<title>Agent Office HQ — dashboard</title>{refresh}
 <style>
 :root{{--ink:#1E2A3B;--muted:#4A5872;--paper:#FFFFFF;--ground:#E3F1EC;--line:#C7D3CF;--accent:#E8573A}}
 @media (prefers-color-scheme: dark){{:root{{--ink:#E8EEF6;--muted:#AFBBD0;--paper:#18212F;--ground:#0F1620;--line:#33415A;--accent:#FF7A5C}}
@@ -275,11 +278,19 @@ table{{width:100%;border-collapse:collapse;font-size:14px}} th,td{{text-align:le
 code{{font-family:Consolas,ui-monospace,monospace;font-size:13px;word-break:break-all}}
 .ok{{color:#1F7A4F;font-weight:700}} .bad{{color:#B03A20;font-weight:700}}
 .grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:18px}}
+.jobs{{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:12px}}
+.job{{border:2px solid var(--line);border-radius:12px;padding:10px 12px;display:flex;flex-direction:column;gap:6px}}
+.job form{{display:inline}} .btns{{display:flex;flex-wrap:wrap;gap:8px;margin-top:auto}}
+button{{font:inherit;font-weight:700;min-height:44px;padding:6px 14px;border-radius:10px;border:2px solid var(--ink);background:var(--paper);color:var(--ink);cursor:pointer}}
+button.live{{background:var(--accent);color:#fff;border-color:var(--accent)}} button:disabled{{opacity:.5;cursor:not-allowed}}
+pre{{white-space:pre-wrap;word-break:break-word;font-family:Consolas,ui-monospace,monospace;font-size:13px;margin:0}}
 </style></head><body><main>
-<header><div><h1>Agent Office HQ</h1><p>Read-only snapshot · {_e(now)}</p></div>
+<header><div><h1>Agent Office HQ</h1><p>{_e(subtitle)} · {_e(now)}</p></div>
 <div class="stats"><span class="stat">Waiting on you: {len(snap.waiting)}</span>
 <span class="stat">In-tray: {len(snap.intray)}</span>
 <span class="stat">Relay tasks completed: {done}</span><span class="stat">Shipped: {shipped}</span></div></header>"""]
+    if controls:
+        parts.append(controls)
 
     parts.append('<section aria-labelledby="w"><h2 id="w">Waiting on you</h2>')
     if snap.waiting:
@@ -301,9 +312,9 @@ code{{font-family:Consolas,ui-monospace,monospace;font-size:13px;word-break:brea
             parts.append(
                 f'<div class="card" style="border-color:var(--line)">{_pill(j.get("status", "?"))} '
                 f'<strong>{_e(j.get("title"))}</strong> · {_e(j.get("desk"))} · '
-                f'<span class="muted">{_e(j.get("level"))} · {_e(str(j.get("generated_at", ""))[:16].replace("T", " "))}</span>'
+                f'<span class="muted">{_e(j.get("level"))} · {_e(uk_time(j.get("generated_at", "")))}</span>'
                 f'<div>{_e(j.get("summary"))}</div>'
-                + ("<ul>" + "".join(f"<li>{_e(f)}</li>" for f in findings[:8]) + "</ul>" if findings else "")
+                + ("<ul>" + "".join(f"<li>{_e(f)}</li>" for f in findings[:14]) + "</ul>" if findings else "")
                 + (f'<div><code>{_e(j.get("next_step"))}</code></div>' if j.get("next_step") else "")
                 + "</div>")
         parts.append("</div>")
@@ -340,9 +351,9 @@ code{{font-family:Consolas,ui-monospace,monospace;font-size:13px;word-break:brea
 
     parts.append('<section aria-labelledby="a"><h2 id="a">Recent activity by desk</h2>')
     if snap.activity:
-        parts.append('<div class="scroll"><table><thead><tr><th>When (UTC)</th><th>Desk</th><th>What</th><th>Task</th></tr></thead><tbody>')
+        parts.append('<div class="scroll"><table><thead><tr><th>When (UK time)</th><th>Desk</th><th>What</th><th>Task</th></tr></thead><tbody>')
         for a in snap.activity:
-            parts.append(f"<tr><td>{_e(a['when'][:19].replace('T', ' '))}</td><td>{_e(a['desk'])}</td>"
+            parts.append(f"<tr><td>{_e(uk_time(a['when'], "%Y-%m-%d %H:%M:%S"))}</td><td>{_e(a['desk'])}</td>"
                          f"<td>{_e(a['what'])}</td><td><code>{_e(a['task'])}</code></td></tr>")
         parts.append("</tbody></table></div>")
     else:
@@ -381,8 +392,12 @@ code{{font-family:Consolas,ui-monospace,monospace;font-size:13px;word-break:brea
     else:
         parts.append('<p class="muted">No ledger tasks.</p>')
     parts.append("</section>")
-    parts.append('<p class="muted">This page is a snapshot generated by <code>python -m office</code>. '
-                 'It changes nothing; every action above is a command for you to run.</p>')
+    if controls:
+        parts.append('<p class="muted">The office app (<code>python -m office.server</code>), '
+                     'on this computer only. Close its window to stop it.</p>')
+    else:
+        parts.append('<p class="muted">This page is a snapshot generated by <code>python -m office</code>. '
+                     'It changes nothing; every action above is a command for you to run.</p>')
     parts.append("</main></body></html>\n")
     return "\n".join(parts)
 

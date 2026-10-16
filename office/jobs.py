@@ -31,10 +31,45 @@ import os
 import re
 import subprocess
 import sys
+import time
+import urllib.error
 import urllib.request
+import xml.etree.ElementTree as ET
+from html.parser import HTMLParser
+from urllib.parse import urlsplit
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+
+try:
+    from zoneinfo import ZoneInfo
+    UK_TZ = ZoneInfo("Europe/London")
+except Exception:  # no time-zone data: fall back to this computer's local time
+    UK_TZ = None
+
+
+def uk_time(value=None, fmt: str = "%Y-%m-%d %H:%M") -> str:
+    """A time for display in UK time (GMT or BST). Records stay in UTC.
+
+    Accepts a datetime, an ISO-8601 string (naive means UTC) or None for now.
+    An empty value gives ""; anything unparseable is returned unchanged.
+    """
+    if value is None:
+        dt = datetime.now(timezone.utc)
+    elif isinstance(value, datetime):
+        dt = value
+    else:
+        text = str(value).strip()
+        if not text:
+            return ""
+        try:
+            dt = datetime.fromisoformat(text)
+        except ValueError:
+            return text
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(UK_TZ).strftime(fmt) if UK_TZ else dt.astimezone().strftime(fmt)
+
 
 DEFAULT_INTRAY = Path.home() / ".agent-office" / "intray"
 # Server details live in this local file, never in the repository:
@@ -91,8 +126,8 @@ JOBS: dict[str, JobSpec] = {
         "you the commands to run them through the two-gate pipeline."),
     "category-images": JobSpec(
         "category-images", "Category images backfill (CCP 3)", "Architect · Designer", "CHANGE", False,
-        "Prepares CCP 3: Gemini/Canva make 1200x630 category images so category pages stop "
-        "sharing the store logo as their social image."),
+        "CCP 3. With --live, audits every category page on the public site for a logo "
+        "fallback og:image (Phase 1); then Gemini/Canva make 1200x630 images (Phase 2)."),
     "reviews-replies": JobSpec(
         "reviews-replies", "Reviews.io reply pack", "The Architect", "DRAFT", False,
         "Turns exported reviews into a reply brief; anything 3 stars or below goes to you "
@@ -300,25 +335,238 @@ def job_social_batch(args) -> JobResult:
 
 # ── category images (CCP 3) ───────────────────────────────────────────────────
 
+CCP3_PHASES = [
+    "Design: Gemini makes the artwork, Canva lays out one 1200x630 social image per "
+    "top-level category. You approve them.",
+    "Phase 2 (change): upload + set each category's image via REST, cache flush, "
+    "targeted Cloudflare purge, then re-run this audit to confirm.",
+]
+LOGO_FALLBACK = "/media/logo/"
+CCP3_FIELDS = ["group", "url", "verdict", "og_image", "status"]
+_CSV_FORMULA_START = ("=", "+", "-", "@", "\t", "\r")
+
+
+def _site_url(url: str | None) -> str | None:
+    """The URL if it is an https page on this site, else None (never fetch anything else)."""
+    if not url:
+        return None
+    url = url.strip()
+    parts = urlsplit(url)
+    return url if parts.scheme == "https" and parts.netloc == urlsplit(SITE).netloc else None
+
+
+def _local(tag: str) -> str:
+    return tag.rsplit("}", 1)[-1]
+
+
+def parse_sitemap(xml_text: str) -> tuple[list[str], list[str]]:
+    """(category page URLs, child sitemap URLs) from a sitemap or sitemap index.
+
+    Category pages are the <url> entries with priority 0.5 (Magento's default for
+    categories). Only https URLs on this site are returned.
+    """
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError:
+        return [], []
+    def loc_of(el):
+        for child in el:
+            if _local(child.tag) == "loc":
+                return _site_url(child.text)
+        return None
+    if _local(root.tag) == "sitemapindex":
+        return [], [u for u in (loc_of(el) for el in root if _local(el.tag) == "sitemap") if u]
+    urls = []
+    for el in root:
+        if _local(el.tag) != "url":
+            continue
+        priority = next((c.text for c in el if _local(c.tag) == "priority"), None)
+        try:
+            is_category = priority is not None and float(priority) == 0.5
+        except ValueError:
+            is_category = False
+        loc = loc_of(el)
+        if is_category and loc:
+            urls.append(loc)
+    return urls, []
+
+
+def category_urls(sitemap_xml: str) -> list[str]:
+    return parse_sitemap(sitemap_xml)[0]
+
+
+class _OgImageParser(HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.image: str | None = None
+
+    def handle_starttag(self, tag, attrs):
+        if tag != "meta" or self.image is not None:
+            return
+        a = {k.lower(): (v or "") for k, v in attrs}
+        if "og:image" in (a.get("property", "").strip().lower(), a.get("name", "").strip().lower()):
+            self.image = a.get("content", "").strip()
+
+
+def og_image(page: str) -> str | None:
+    """The page's og:image (entities decoded), or None."""
+    parser = _OgImageParser()
+    try:
+        parser.feed(page)
+        parser.close()
+    except Exception:  # malformed markup: use whatever was found
+        pass
+    return parser.image or None
+
+
+def category_group(url: str) -> str:
+    """Top-level group of a category URL: 'home-appliances', 'brands', ..."""
+    path = urlsplit(url).path.lstrip("/")
+    if path.startswith("catalog/category/view/"):
+        return "no friendly URL"
+    return path.split("/")[0].removesuffix(".html") or "(home)"
+
+
+_BOT_CHECK = re.compile(r"<title>\s*One moment, please", re.I)
+
+
+def classify_page(status, page: str) -> tuple[str, str]:
+    """(verdict, og:image) for one fetched category page."""
+    if status != 200:
+        return f"HTTP {status}", ""
+    if _BOT_CHECK.search(page[:5000]):
+        return "bot check", ""
+    image = og_image(page)
+    if not image:
+        return "no og:image", ""
+    if not image.lower().startswith(("http://", "https://")):
+        return "relative og:image", image
+    if LOGO_FALLBACK in image:
+        return "logo fallback", image
+    return "has image", image
+
+
+def audit_category_images(urls: list[str], fetch, delay: float = 0.5,
+                          deadline: float | None = None, on_row=None,
+                          bot_wait: float = 20.0) -> list[dict]:
+    """Fetch each category page (one at a time) and record its og:image.
+
+    Stops early, without error, once time.monotonic() passes `deadline`.
+    """
+    rows = []
+    for i, url in enumerate(urls):
+        if deadline is not None and time.monotonic() > deadline:
+            break
+        if i and delay:
+            time.sleep(delay)
+        try:
+            status, page = fetch(url)
+            verdict, image = classify_page(status, page)
+            if verdict == "bot check":  # the host's firewall paused us: back off, retry once
+                time.sleep(bot_wait)
+                status, page = fetch(url)
+                verdict, image = classify_page(status, page)
+        except Exception as exc:  # one bad page must not stop the audit
+            status, verdict, image = "error", f"error: {exc}"[:120], ""
+        row = {"url": url, "group": category_group(url), "status": status,
+               "og_image": image, "verdict": verdict}
+        rows.append(row)
+        if on_row:
+            on_row(row)
+    return rows
+
+
+def _csv_safe(value) -> str:
+    text = "" if value is None else str(value)
+    return "'" + text if text.startswith(_CSV_FORMULA_START) else text
+
+
+def _md_cell(value) -> str:
+    return " ".join(str(value).split()).replace("|", "\\|")
+
+
+def _write_ccp3_markdown(path: Path, rows: list[dict], total: int) -> None:
+    groups: dict[str, dict] = {}
+    for r in rows:
+        g = groups.setdefault(r["group"], {"total": 0, "missing": []})
+        g["total"] += 1
+        if r["verdict"] != "has image":
+            g["missing"].append(r)
+    missing = sum(len(g["missing"]) for g in groups.values())
+    lines = ["# CCP 3 Phase 1: category social images", "",
+             f"{missing} of {len(rows)} category pages checked do not share their own image "
+             "(logo fallback, no or relative og:image, or not reachable)."]
+    if len(rows) < total:
+        lines.append(f"**Stopped early:** {len(rows)} of {total} pages checked (time limit).")
+    lines += ["", "| Group | Pages | Missing an image |", "|---|---|---|"]
+    for name, g in sorted(groups.items(), key=lambda kv: -len(kv[1]["missing"])):
+        lines.append(f"| {_md_cell(name)} | {g['total']} | {len(g['missing'])} |")
+    lines += ["", "## Pages missing an image", ""]
+    for name, g in sorted(groups.items()):
+        if g["missing"]:
+            lines += [f"### {_md_cell(name)}", ""]
+            lines += [f"- {_md_cell(r['url'])} ({_md_cell(r['verdict'])})" for r in g["missing"]]
+            lines.append("")
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
 def job_category_images(args) -> JobResult:
     spec = JOBS["category-images"]
+    base = dict(job=spec.name, title=spec.title, desk=spec.desk, level=spec.level)
+    if not args.live:
+        return JobResult(
+            **base, status="NEEDS_YOU",
+            summary=("CCP 3 is written and queued. Category pages without an image share the "
+                     "store logo as their social image (e.g. /home-appliances.html)."),
+            findings=["Phase 1 (read-only): audit every category page on the public site; "
+                      "run with --live."] + CCP3_PHASES,
+            next_step="python -m office.jobs run category-images --live")
+    try:
+        status, sitemap = _fetch(f"{SITE}/sitemap.xml", limit=20_000_000)
+        urls, children = parse_sitemap(sitemap) if status == 200 else ([], [])
+        for child in children[:20]:
+            child_status, child_xml = _fetch(child, limit=20_000_000)
+            if child_status == 200:
+                urls += parse_sitemap(child_xml)[0]
+    except Exception as exc:
+        return JobResult(**base, status="ERROR", live=True, summary=f"Could not read the sitemap: {exc}")
+    urls = list(dict.fromkeys(urls))
+    if not urls:
+        return JobResult(**base, status="ERROR", live=True,
+                         summary=f"No category pages found in the sitemap (HTTP {status}).")
+    intray = Path(args.intray)
+    intray.mkdir(parents=True, exist_ok=True)
+    csv_path, md_path = intray / "ccp3-audit.csv", intray / "ccp3-audit.md"
+    import csv
+    with csv_path.open("w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=CCP3_FIELDS)
+        writer.writeheader()
+
+        def write_row(row):  # written as we go, so a stopped audit keeps its results
+            writer.writerow({k: _csv_safe(row[k]) for k in CCP3_FIELDS})
+            fh.flush()
+        rows = audit_category_images(urls, _fetch, delay=args.delay,
+                                     deadline=time.monotonic() + args.max_minutes * 60,
+                                     on_row=write_row)
+    _write_ccp3_markdown(md_path, rows, len(urls))
+    missing = [r for r in rows if r["verdict"] != "has image"]
+    by_group: dict[str, int] = {}
+    for r in missing:
+        by_group[r["group"]] = by_group.get(r["group"], 0) + 1
+    findings = [f"{name}: {n} page(s)" for name, n in
+                sorted(by_group.items(), key=lambda kv: -kv[1])[:12]]
+    if len(rows) < len(urls):
+        findings.insert(0, f"Stopped early at the {args.max_minutes}-minute limit: "
+                           f"{len(rows)} of {len(urls)} pages checked.")
+    findings = [f"Report: {md_path}", f"Full list: {csv_path}"] + findings + CCP3_PHASES
     return JobResult(
-        job=spec.name, title=spec.title, desk=spec.desk, level=spec.level, status="NEEDS_YOU",
-        summary=("CCP 3 is written and queued. Category pages without an image share the store "
-                 "logo as their social image (e.g. /home-appliances.html)."),
-        findings=[
-            "Phase 1 (read-only): list active categories with no image (CCP 3 has the SQL); "
-            "needs your OK for a supervised SSH + database read.",
-            "Design: Gemini makes the artwork, Canva lays out 1200x630 social images per "
-            "top-level category (~15-20). You approve them.",
-            "Phase 2 (change): upload + set each category's image via REST, cache flush, "
-            "targeted Cloudflare purge, then verify og:image per page.",
-            "Office route: an A2A T2 task; your approval at Gate 1 and Gate 2; live deploy "
-            "stays your runbook.",
-        ],
-        next_step=("a2a create-task --title \"CCP 3: backfill category images\" --tier T2 "
-                   "--issue-url <github issue> --actor <you>"),
-    )
+        **base, live=True, status="NEEDS_YOU" if missing or len(rows) < len(urls) else "OK",
+        summary=(f"Phase 1 done: {len(missing)} of {len(rows)} category pages share no image of "
+                 f"their own, across {len(by_group)} top-level group(s)."
+                 if missing else f"All {len(rows)} category pages checked share their own image."),
+        findings=findings,
+        next_step=("Decide which groups get artwork first; Phase 2 needs the images and your "
+                   "approval for the live changes." if missing else ""))
 
 
 # ── Reviews.io replies ────────────────────────────────────────────────────────
@@ -392,10 +640,14 @@ def job_reviews_replies(args) -> JobResult:
 
 # ── morning briefing ──────────────────────────────────────────────────────────
 
-def _fetch(url: str) -> tuple[int, str]:
+def _fetch(url: str, limit: int = 200_000) -> tuple[int, str]:
+    """GET a public page: (status, first `limit` bytes as text). HTTP errors are statuses."""
     req = urllib.request.Request(url, headers={"User-Agent": "AgentOffice/1.0 (read-only check)"})
-    with urllib.request.urlopen(req, timeout=20) as resp:  # noqa: S310 - fixed https URLs
-        return resp.status, resp.read(200_000).decode("utf-8", errors="replace")
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:  # noqa: S310 - fixed https URLs
+            return resp.status, resp.read(limit).decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as exc:
+        return exc.code, ""
 
 
 def check_robots(text: str) -> list[str]:
@@ -437,9 +689,9 @@ def job_morning_briefing(args) -> JobResult:
             continue
         status = str(result.get("status", "?"))
         alert = alert or status in ("ALERT", "ERROR")
-        when = str(result.get("generated_at", ""))[:16].replace("T", " ")
+        when = uk_time(result.get("generated_at", ""))
         findings.append(f"{JOBS[name].title}: {status}: {result.get('summary', '')}"
-                        + (f" (as of {when} UTC)" if when else ""))
+                        + (f" (as of {when})" if when else ""))
     if args.live:
         try:
             status, text = _fetch(f"{SITE}/robots.txt")
@@ -511,6 +763,10 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--social-repo", default=str(DEFAULT_SOCIAL_REPO))
     run.add_argument("--count", type=_positive_int, default=3)
     run.add_argument("--input", default=None, help="reviews JSON for reviews-replies")
+    run.add_argument("--delay", type=float, default=2.0,
+                     help="seconds between page fetches in the category-images audit")
+    run.add_argument("--max-minutes", type=_positive_int, default=50,
+                     help="time limit for the category-images audit")
     run.add_argument("--relay-db", default="relay.db")
     run.add_argument("--a2a-db", default="a2a.db")
     args = parser.parse_args(argv)

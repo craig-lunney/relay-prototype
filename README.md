@@ -29,7 +29,7 @@ This is a **research prototype**, not a production system. Read
 |---|---|---|
 | **Relay** (`relay/`) | Validates a task against policy, copies the target repository into a disposable workspace under an exclusive lease, runs the Claude Code worker there with a restricted tool allowlist and curated environment, then **independently verifies** the result: workspace integrity (hash manifest), protected tests and test configuration, required tests, acceptance criteria. Records everything in an append-only audit log. | Execution state of a Relay task (`relay.db`) |
 | **A2A ledger** (`a2a/`) | Tracks a task through the frozen [A2A protocol v0.2](docs/a2a-protocol-v0.2.md): enforces the state graph, tier paths, which role may take each step, required evidence, the Relay evidence link, and the T3 human re-run — and records each step in an append-only history. | Protocol state of an A2A task (`a2a.db`) |
-| **Agent Office** (`office/`) | A read-only dashboard over both databases (`python -m office`) and the morning in-tray jobs (`python -m office.jobs`): crontab guard, morning briefing, weekly social batch, category images (CCP 3), Reviews.io reply pack. Jobs report or prepare drafts; none writes to a live system. | Nothing — it only reads |
+| **Agent Office** (`office/`) | A read-only dashboard over both databases (`python -m office`), a local app with a button per job (`python -m office.server`), and the morning in-tray jobs (`python -m office.jobs`): crontab guard, morning briefing, weekly social batch, category images (CCP 3), Reviews.io reply pack. Jobs report or prepare drafts; none writes to a live system. | Nothing — it only reads |
 
 The two are linked **by reference**: an A2A task can only enter review (T2/T3)
 or Gate 2 (T1) by citing a Relay task that is `COMPLETED`. A2A reads the Relay
@@ -130,7 +130,9 @@ python -m office.jobs list                       # the five in-tray jobs
 python -m office.jobs run social-batch           # reads ~/lunneys-social, read-only
 python -m office.jobs run crontab-guard --live   # read-only SSH: crontab -l
 python -m office.jobs run morning-briefing       # add --live for robots.txt + sitemap
+python -m office.jobs run category-images --live # CCP 3 audit of public category pages
 python -m office                                 # writes office.html
+python -m office.server                          # the office as an app: a button per job
 ```
 
 `office.html` shows what is waiting on you (Relay decisions, A2A gates, the T3

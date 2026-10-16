@@ -169,6 +169,12 @@ is the human's attestation.
   one of the required entries.
 - `social-batch` treats an item as used once it has an approved visual; it does
   not know whether the post was actually published.
+- The office app trusts anyone who can use this computer's browser: its
+  protections are against other websites, not other local users. Its buttons
+  only run the jobs above; none changes a live system.
+- The CCP 3 audit reads public pages. Fetching ~260 pages can trip the host's
+  bot check; the audit backs off and retries once, then reports `bot check`
+  for that page. Treat those rows as unknown, not as missing an image.
 - `reviews-replies` needs an exported reviews file until Reviews.io is
   connected; the Base.com sections of the briefing need the Base MCP.
 - The dashboard never changes either database's contents, but SQLite may leave
