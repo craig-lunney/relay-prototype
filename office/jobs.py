@@ -136,6 +136,11 @@ JOBS: dict[str, JobSpec] = {
         "crontab-guard", "Crontab guard", "The Inspector", "REPORT", True,
         "Checks the live crontab has not shrunk below its baseline and that the key entries "
         "named in ~/.agent-office/config.json are live (the 3 Aug incident wiped 19 entries)."),
+    "euronics-images": JobSpec(
+        "euronics-images", "Euronics images", "The Clerk", "CHANGE", True,
+        "Shows the daily result of the Lunneys scripts task that adds Euronics images to "
+        "disabled lines once Euronics publishes them, then puts them back on sale. The task "
+        "runs outside the office (the office itself never writes); this is its report."),
     "morning-briefing": JobSpec(
         "morning-briefing", "Morning briefing", "The Clerk", "REPORT", False,
         "One page: what's waiting on you, every in-tray result, and (with --live) the "
