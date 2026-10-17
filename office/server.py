@@ -44,6 +44,7 @@ BUTTONS: dict[str, list[tuple[str, bool]]] = {
     "share-preview": [("Check link", True)],
     "product-copy": [("Run live", True)],
     "ai-readiness": [("Run live", True)],
+    "critical-css-drift": [("Run live", True)],
     "crontab-guard": [("Run live", True)],
     "euronics-images": [],                        # report only: written by a Lunneys scripts task
     "morning-briefing": [("Run", False), ("Run live", True)],

@@ -7,6 +7,7 @@ Agent Office — the morning in-tray jobs (Batch 7).
     python -m office.jobs run morning-briefing [--live]
     python -m office.jobs run reviews-replies --input reviews.json
     python -m office.jobs run category-images
+    python -m office.jobs run critical-css-drift --live
 
 Every job writes its result to the in-tray folder (default
 ``~/.agent-office/intray``, or "intray" in the local config) as ``<job>.json`` plus, where useful, a Markdown
@@ -36,6 +37,7 @@ import urllib.error
 import urllib.request
 import urllib.parse
 import xml.etree.ElementTree as ET
+from html import unescape as html_unescape
 from html.parser import HTMLParser
 from urllib.parse import urlsplit
 from dataclasses import asdict, dataclass, field
@@ -132,6 +134,11 @@ JOBS: dict[str, JobSpec] = {
         "share-preview", "Share preview", "The Designer", "REPORT", True,
         "Shows how a loshop.co.uk link will look when shared on Facebook or WhatsApp, and "
         "flags a missing, broken or badly sized share image."),
+    "critical-css-drift": JobSpec(
+        "critical-css-drift", "Critical CSS drift check", "The Inspector", "REPORT", True,
+        "Checks that the inline critical CSS on the home, category and product pages still "
+        "matches the live header, USP and merged stylesheets it was copied from (CCP 11/12). "
+        "If it drifts, the first-visit layout shift comes back."),
     "crontab-guard": JobSpec(
         "crontab-guard", "Crontab guard", "The Inspector", "REPORT", True,
         "Checks the live crontab has not shrunk below its baseline and that the key entries "
@@ -1754,6 +1761,156 @@ def job_morning_briefing(args) -> JobResult:
                      summary=f"Briefing written: {note.name}", findings=findings)
 
 
+# ── critical CSS drift (CCP 11/12) ────────────────────────────────────────────
+
+# (name, path, has a CCP 12 block). Product pages only got CCP 11.
+CRITICAL_PAGES = [
+    ("home", "/", True),
+    ("category", "/home-appliances/laundry/washing-machines.html", True),
+    ("product", "/samsung-rs70f66kcfeu-91cm-side-by-side-american-fridge-freezer-stainless-steel-black.html",
+     False),
+]
+CRITICAL_STYLE = re.compile(r'<style\b[^>]*\bid="lunneys-critical-css"[^>]*>(.*?)</style>', re.S | re.I)
+CCP11_MARK = "/* CCP 11: header + USP strip"
+CCP12_MARK = "/* CCP 12: offers grid"
+CCP11_FILES = ("lunneys-header.min.css", "usp-strip.min.css")
+CCP11_DIR = "frontend/Lunneys/blank/en_GB/Lunneys_Seo/css"
+# The selector pattern CCP 12 extracted with (ccps/ccp12_critical_css/extract.py).
+CCP12_PATTERN = re.compile(r"(^|,)\s*h[1-3]\s*(,|$)|\.page-title|lun-offer|lun-cat|\.breadcrumbs")
+_LINK_HREF = re.compile(r'<link\b[^>]*\bhref="([^"]+)"', re.I)
+_STATIC_VERSION = re.compile(r"^https://loshop\.co\.uk/static/(version\d+)/")
+_MERGED_CSS = re.compile(r"^https://loshop\.co\.uk/static/version\d+/_cache/merged/[0-9a-f]+\.min\.css$")
+
+
+def _css_blocks(text: str):
+    """Yield (prelude, body) for each top-level block of minified CSS."""
+    i, n = 0, len(text)
+    while i < n:
+        j = text.find("{", i)
+        if j < 0:
+            return
+        prelude = text[i:j].strip()
+        depth, k = 1, j + 1
+        while k < n and depth:
+            if text[k] == "{":
+                depth += 1
+            elif text[k] == "}":
+                depth -= 1
+            k += 1
+        yield prelude, text[j + 1:k - 1]
+        i = k
+
+
+def extract_css_rules(css: str, pattern=CCP12_PATTERN) -> tuple[str, int]:
+    """(rules, count): every rule whose selector matches, in order, keeping any @media/@supports
+    wrapper; other at-rules are dropped. A port of CCP 12's extract.py, so the output is the same."""
+    css = re.sub(r"/\*.*?\*/", "", css, flags=re.S)
+    parts, count = [], 0
+    for prelude, body in _css_blocks(css):
+        if prelude.startswith("@media") or prelude.startswith("@supports"):
+            inner = [f"{p}{{{b}}}" for p, b in _css_blocks(body) if pattern.search(p)]
+            if inner:
+                parts.append(f"{prelude}{{{''.join(inner)}}}")
+                count += len(inner)
+        elif prelude.startswith("@"):
+            continue  # @font-face, @keyframes, @charset: not needed for layout
+        elif pattern.search(prelude):
+            parts.append(f"{prelude}{{{body}}}")
+            count += 1
+    return "".join(parts), count
+
+
+def critical_css(page: str) -> str | None:
+    """The inline <style id="lunneys-critical-css"> text, or None."""
+    m = CRITICAL_STYLE.search(page)
+    return m.group(1) if m else None
+
+
+def page_css_links(page: str) -> tuple[str | None, str | None]:
+    """(static version, merged CSS URL) from the page's own <link> tags; None where absent."""
+    hrefs = [html_unescape(h) for h in _LINK_HREF.findall(page)]
+    version = next((m.group(1) for m in map(_STATIC_VERSION.match, hrefs) if m), None)
+    merged = next((h for h in hrefs if _MERGED_CSS.match(h)), None)
+    return version, merged
+
+
+def check_critical_block(critical: str, mark: str, sources: dict[str, str]) -> list[str]:
+    """Names of the sources not found verbatim after `mark` (all of them if `mark` is missing)."""
+    at = critical.find(mark)
+    if at < 0:
+        return list(sources)
+    block = critical[at:]
+    return [name for name, text in sources.items() if text.strip() not in block]
+
+
+def job_critical_css_drift(args) -> JobResult:
+    spec = JOBS["critical-css-drift"]
+    base = dict(job=spec.name, title=spec.title, desk=spec.desk, level=spec.level)
+    if not args.live:
+        return JobResult(**base, status="NEEDS_YOU", summary="Ready: run it live to read the pages.",
+                         next_step="python -m office.jobs run critical-css-drift --live")
+    pace, cache = _Pacer(args.delay), {}
+
+    def get(url: str) -> str:
+        if url not in cache:
+            status, text = _paced_page(url, pace, 20.0)
+            if status != 200:
+                why = "the host's bot check answered" if status == "bot check" else f"HTTP {status}"
+                raise RuntimeError(f"{url}: {why}")
+            cache[url] = text
+        return cache[url]
+
+    findings, drifted = [], []
+    bust = f"?office={int(time.time())}"
+    try:
+        for name, path, has_ccp12 in CRITICAL_PAGES:
+            page = get(SITE + path + bust)
+            critical = critical_css(page)
+            if critical is None:
+                drifted.append(f"{name} (no critical CSS)")
+                findings.append(f"{name}: the inline lunneys-critical-css block is missing.")
+                continue
+            version, merged = page_css_links(page)
+            if not version:
+                raise RuntimeError(f"{name}: no /static/version... link on the page")
+            sources = {f: get(f"{SITE}/static/{version}/{CCP11_DIR}/{f}") for f in CCP11_FILES}
+            missing = check_critical_block(critical, CCP11_MARK, sources)
+            if missing:
+                drifted.append(f"{name} CCP 11")
+                findings.append(f"{name}: CCP 11 block drifted: " + (
+                    "the block's comment is missing." if CCP11_MARK not in critical else
+                    ", ".join(missing) + " no longer appears verbatim."))
+            else:
+                findings.append(f"{name}: CCP 11 block matches ({version}).")
+            if not has_ccp12:
+                continue
+            if not merged:
+                raise RuntimeError(f"{name}: no _cache/merged/*.min.css link on the page")
+            rules, count = extract_css_rules(get(merged))
+            label = f"merged CSS {merged.rsplit('/', 1)[-1][:8]}..."
+            missing = check_critical_block(critical, CCP12_MARK, {label: rules})
+            if missing:
+                drifted.append(f"{name} CCP 12")
+                findings.append(f"{name}: CCP 12 block drifted: " + (
+                    "the block's comment is missing." if CCP12_MARK not in critical else
+                    f"the {count} matching rules from the {label} no longer appear verbatim."))
+            else:
+                findings.append(f"{name}: CCP 12 block matches ({count} rules, {len(rules) // 1024} KB "
+                                f"from the {label}).")
+    except Exception as exc:
+        return JobResult(**base, status="ERROR", live=True, findings=findings,
+                         summary=f"Could not finish the check: {exc}")
+    if drifted:
+        return JobResult(**base, status="ALERT", live=True, findings=findings,
+                         summary="Critical CSS has drifted from the live stylesheets: " + ", ".join(drifted)
+                                 + ". The first-visit layout shift will come back.",
+                         next_step="refresh the CCP 11/12 block in "
+                                   "app/code/Lunneys/CriticalCss/critical/*.css (see ccps_ready.md CCP 11/12)")
+    return JobResult(**base, status="OK", live=True, findings=findings,
+                     summary="Critical CSS matches the live header, USP and merged stylesheets on "
+                             "home, category and product pages.")
+
+
 # ── plumbing ──────────────────────────────────────────────────────────────────
 
 RUNNERS = {
@@ -1761,6 +1918,7 @@ RUNNERS = {
     "share-preview": job_share_preview,
     "product-copy": job_product_copy,
     "ai-readiness": job_ai_readiness,
+    "critical-css-drift": job_critical_css_drift,
     "crontab-guard": job_crontab_guard,
     "morning-briefing": job_morning_briefing,
     "social-batch": job_social_batch,
@@ -1809,7 +1967,7 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--input", default=None, help="reviews JSON for reviews-replies")
     run.add_argument("--url", default=None, help="the loshop.co.uk link for share-preview")
     run.add_argument("--delay", type=float, default=2.0,
-                     help="seconds between page fetches (category-images, ai-readiness)")
+                     help="seconds between page fetches (category-images, ai-readiness, critical-css-drift)")
     run.add_argument("--max-minutes", type=_positive_int, default=50,
                      help="time limit for the category-images and ai-readiness audits")
     run.add_argument("--sample", type=_positive_int, default=40,
