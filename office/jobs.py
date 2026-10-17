@@ -9,7 +9,7 @@ Agent Office — the morning in-tray jobs (Batch 7).
     python -m office.jobs run category-images
 
 Every job writes its result to the in-tray folder (default
-``~/.agent-office/intray``) as ``<job>.json`` plus, where useful, a Markdown
+``~/.agent-office/intray``, or "intray" in the local config) as ``<job>.json`` plus, where useful, a Markdown
 note.  ``python -m office`` shows the in-tray with everything else waiting on
 you.
 
@@ -159,6 +159,22 @@ JOBS: dict[str, JobSpec] = {
 
 class ConfigError(ValueError):
     """The crontab-guard section of the local config is missing or invalid."""
+
+
+def intray_dir(config: Path) -> Path:
+    """The in-tray (reports) folder: "intray" in the local config if set, else the default.
+
+    e.g. {"intray": "C:/Users/me/OneDrive/Desktop/Agent Office reports"}. Only the reports
+    move; the config file itself (server details) stays in ~/.agent-office.
+    """
+    try:
+        data = json.loads(Path(config).read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return DEFAULT_INTRAY
+    value = data.get("intray") if isinstance(data, dict) else None
+    if not isinstance(value, str) or not value.strip():
+        return DEFAULT_INTRAY
+    return Path(os.path.expandvars(os.path.expanduser(value.strip())))
 
 
 def retired_jobs(path: Path) -> frozenset[str]:
@@ -1436,7 +1452,8 @@ def _write_ai_markdown(path: Path, rows, euronics_rows, scores, site, fixes, ove
         clean, checked = scores[area]
         lines.append(f"| {area} | {round(100 * clean / checked) if checked else '-'} | "
                      f"{clean} of {checked} products |")
-    lines.append(f"| {SITE_AREA} (site) | {site['score']} | {site['passed']} of 2 checks |")
+    lines.append(f"| {SITE_AREA} (site) | {'-' if site['score'] is None else site['score']} | "
+                 f"{site['passed']} of {site['checked']} checks |")
     lines += ["", "## Top fixes", ""]
     if not fixes:
         lines.append("Nothing to fix in this sample.")
@@ -1501,12 +1518,17 @@ def job_ai_readiness(args) -> JobResult:
              else p.get("energy_rating"),
              "in_stock": stock_status(api, p.get("sku"))}
         (euronics_rows if _is_euronics(p) else rows).append(audit_ai_product(p, pace))
+    # Each site check passes (True), fails (False) or could not be made (None): the host's
+    # bot check answering instead of the file is "not checked", not a failure.
     site_problems, site_lines, alert = [], [], False
+    checks: dict[str, bool | None] = {"robots": None, "llms": None}
     try:
         status, robots = _paced_page(f"{SITE}/robots.txt", pace, 20.0)
-        if status == 200:
+        if status == "bot check":
+            site_lines.append("robots.txt: not checked (the host's bot check answered; run again later)")
+        elif status == 200:
             blocked, others = check_ai_crawlers(robots, rows[0]["url"] if rows and rows[0]["url"] else SITE + "/")
-            alert = bool(blocked)
+            alert, checks["robots"] = bool(blocked), not blocked
             site_problems += [f"robots.txt blocks {a}" for a in blocked]
             site_lines.append("robots.txt: " + ("blocks " + ", ".join(blocked) if blocked else
                                                 f"all {len(AI_CRAWLERS)} AI and search crawlers checked "
@@ -1515,22 +1537,27 @@ def job_ai_readiness(args) -> JobResult:
                 site_lines.append("Also blocked (training or scraping only; not used for shopping "
                                   "answers): " + ", ".join(others))
         else:
+            checks["robots"] = False
             site_problems.append(f"robots.txt not readable (HTTP {status})")
             site_lines.append(site_problems[-1])
         status, llms = _paced_page(f"{SITE}/llms.txt", pace, 20.0)
-        problems = check_llms(status, llms)
-        site_problems += problems
-        site_lines.append("llms.txt: " + ("; ".join(problems) if problems else
-                                          f"present ({len(llms.encode('utf-8'))} bytes)"))
-    except Exception as exc:
-        site_problems.append(f"site checks failed: {str(exc)[:120]}")
-        site_lines.append(site_problems[-1])
-    robots_ok = not any(p.startswith("robots") or p.startswith("site checks") for p in site_problems)
-    llms_ok = not any("llms" in p or p.startswith("site checks") for p in site_problems)
-    site = {"passed": robots_ok + llms_ok, "score": 50 * (robots_ok + llms_ok), "lines": site_lines}
+        if status == "bot check":
+            site_lines.append("llms.txt: not checked (the host's bot check answered; run again later)")
+        else:
+            problems = check_llms(status, llms)
+            checks["llms"] = not problems
+            site_problems += problems
+            site_lines.append("llms.txt: " + ("; ".join(problems) if problems else
+                                              f"present ({len(llms.encode('utf-8'))} bytes)"))
+    except Exception as exc:  # not reachable: the checks stay "not checked"
+        site_lines.append(f"site checks not made: {str(exc)[:120]}")
+    made = [ok for ok in checks.values() if ok is not None]
+    site = {"passed": sum(made), "checked": len(made), "lines": site_lines,
+            "score": round(100 * sum(made) / len(made)) if made else None}
     scores = ai_scores(rows)
-    parts = [round(100 * c / n) for c, n in scores.values() if n] + [site["score"]]
-    overall = round(sum(parts) / len(parts))
+    parts = [round(100 * c / n) for c, n in scores.values() if n] + (
+        [site["score"]] if site["score"] is not None else [])
+    overall = round(sum(parts) / len(parts)) if parts else 0
     fixes = top_ai_fixes(rows, site_problems)
     stopped = len(rows) + len(euronics_rows) < len(sample) + len(euronics)
     note = (f"Stopped early at the {args.max_minutes}-minute limit." if stopped else "")
@@ -1550,7 +1577,8 @@ def job_ai_readiness(args) -> JobResult:
     _write_ai_markdown(md_path, rows, euronics_rows, scores, site, fixes, overall,
                        sum(1 for p in products if not _is_euronics(p)), note)
     area_line = ", ".join(f"{a.lower()} {round(100 * c / n) if n else '-'}" for a, (c, n) in scores.items())
-    findings = ([note] if note else []) + [f"Scores: {area_line}, crawler access {site['score']}."]
+    crawl = "not checked" if site["score"] is None else site["score"]
+    findings = ([note] if note else []) + [f"Scores: {area_line}, crawler access {crawl}."]
     findings += [f"Fix {i}: {f['area']}: {f['issue']} ({f['count']} product(s))"
                  if f["skus"] else f"Fix {i}: {f['issue']} (site-wide)" for i, f in enumerate(fixes[:5], 1)]
     findings += [f"Euronics agency items: {len(euronics_rows)} checked, reported separately.",
@@ -1761,7 +1789,8 @@ def _positive_int(value: str) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="office.jobs", description="Agent Office in-tray jobs")
-    parser.add_argument("--intray", default=str(DEFAULT_INTRAY), help="in-tray folder")
+    parser.add_argument("--intray", default=None,
+                        help='in-tray folder (default: "intray" in the config, else ~/.agent-office/intray)')
     parser.add_argument("--config", default=str(DEFAULT_CONFIG),
                         help="local settings file (server details; never in the repository)")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -1785,6 +1814,7 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--relay-db", default="relay.db")
     run.add_argument("--a2a-db", default="a2a.db")
     args = parser.parse_args(argv)
+    args.intray = args.intray or str(intray_dir(Path(args.config)))
     for stream in (sys.stdout, sys.stderr):
         try:
             stream.reconfigure(errors="replace")

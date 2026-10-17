@@ -642,3 +642,45 @@ def test_ai_readiness_alerts_when_robots_blocks_an_ai_crawler(tmp_path, monkeypa
     assert code == 1 and result["status"] == "ALERT"
     assert any("robots.txt blocks OAI-SearchBot" in f for f in result["findings"])
     assert any("/llms.txt not found" in f for f in result["findings"])
+
+
+def test_ai_readiness_bot_check_on_site_files_is_not_a_failure(tmp_path, monkeypatch):
+    # 2026-10-17: the host's bot check answered robots.txt and the job scored it as a failure
+    bot = "<html><title>One moment, please...</title></html>"
+    pages = {"https://loshop.co.uk/good1.html": _page(_ld())}
+    monkeypatch.setattr(jobs, "_fetch", lambda url, limit=0: (200, pages.get(url, bot)))
+    monkeypatch.setattr(jobs.time, "sleep", lambda s: None)
+    _fake_site(monkeypatch, pages, [_ai(sku="GOOD1", url_key="good1")])
+    code, result, intray = _run(tmp_path, "run", "ai-readiness", "--live", "--delay", "0",
+                                config=_ai_config(tmp_path))
+    assert code == 0 and result["status"] == "OK", result
+    assert "crawler access not checked" in result["findings"][0]
+    md = (intray / "ai-readiness.md").read_text(encoding="utf-8")
+    assert "| Crawler access (site) | - | 0 of 0 checks |" in md and "**Overall score: 100/100**" in md
+    assert "robots.txt: not checked" in md and "llms.txt: not checked" in md
+    assert "Crawler access:" not in md.split("## Top fixes")[1].split("## Site checks")[0]
+
+
+# ── reports folder ────────────────────────────────────────────────────────────
+
+def test_reports_folder_comes_from_the_config(tmp_path):
+    reports = tmp_path / "OneDrive" / "Desktop" / "Agent Office reports"
+    config = tmp_path / "c.json"
+    config.write_text(json.dumps({"intray": str(reports)}), encoding="utf-8")
+    assert jobs.intray_dir(config) == reports
+    assert jobs.main(["--config", str(config), "run", "reviews-replies"]) == 0
+    assert (reports / "reviews-replies.json").is_file()
+    for bad in ({}, {"intray": ""}, {"intray": 5}):
+        config.write_text(json.dumps(bad), encoding="utf-8")
+        assert jobs.intray_dir(config) == jobs.DEFAULT_INTRAY
+    assert jobs.intray_dir(tmp_path / "missing.json") == jobs.DEFAULT_INTRAY
+
+
+def test_notify_reads_the_configured_reports_folder(tmp_path):
+    reports = tmp_path / "reports"
+    _results(reports, crontab_guard="ALERT")
+    config = tmp_path / "c.json"
+    config.write_text(json.dumps({"intray": str(reports)}), encoding="utf-8")
+    calls = []
+    notify.main(["--config", str(config)], run=lambda argv, **kw: calls.append(argv) or SimpleNamespace(returncode=0))
+    assert calls, "the alert in the configured folder was not seen"

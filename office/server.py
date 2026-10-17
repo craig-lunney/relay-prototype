@@ -34,7 +34,7 @@ from typing import Callable
 from urllib.parse import parse_qs
 
 from .dashboard import render, snapshot
-from .jobs import DEFAULT_CONFIG, DEFAULT_INTRAY, JOBS, SHARE_URL, retired_jobs, uk_time
+from .jobs import DEFAULT_CONFIG, intray_dir, JOBS, SHARE_URL, retired_jobs, uk_time
 
 ROOT = Path(__file__).resolve().parent.parent
 # The buttons each job gets: (label, live). A live-only job has no offline button,
@@ -287,10 +287,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--relay-db", type=Path, default=ROOT / "relay.db")
     parser.add_argument("--a2a-db", type=Path, default=ROOT / "a2a.db")
-    parser.add_argument("--intray", type=Path, default=DEFAULT_INTRAY)
+    parser.add_argument("--intray", type=Path, default=None)
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     parser.add_argument("--no-browser", action="store_true")
     args = parser.parse_args(argv)
+    args.intray = args.intray or intray_dir(args.config)
     state = OfficeState(relay_db=args.relay_db, a2a_db=args.a2a_db, intray=args.intray,
                         config=args.config, port=args.port)
     try:

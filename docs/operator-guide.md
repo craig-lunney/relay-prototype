@@ -214,7 +214,7 @@ python -m office.jobs [--intray DIR] list
 python -m office.jobs [--intray DIR] run <job> [--live] [job options]
 ```
 
-The in-tray folder defaults to `~/.agent-office/intray`. Each run writes
+The in-tray folder defaults to `~/.agent-office/intray`; set `"intray": "<folder>"` in `~/.agent-office/config.json` to keep the reports somewhere else (for example a OneDrive folder). Only the reports move: the config file stays in `~/.agent-office`. Each run writes
 `<job>.json` there (status, summary, findings, next step); the dashboard shows
 the latest result of every job. The exit code is 1 when a job's status is
 `ALERT` or `ERROR`, so a scheduler can notice.

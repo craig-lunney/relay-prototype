@@ -31,7 +31,7 @@ from pathlib import Path
 
 from relay.state import GENESIS_HASH, event_hash
 
-from .jobs import DEFAULT_CONFIG, DEFAULT_INTRAY, JOBS, retired_jobs, uk_time
+from .jobs import DEFAULT_CONFIG, intray_dir, JOBS, retired_jobs, uk_time
 
 # Statuses that need the boss, with the command that resolves them.
 _RELAY_WAITING = {
@@ -437,9 +437,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--relay-db", type=Path, default=Path("relay.db"))
     parser.add_argument("--a2a-db", type=Path, default=Path("a2a.db"))
     parser.add_argument("--out", type=Path, default=Path("office.html"))
-    parser.add_argument("--intray", type=Path, default=DEFAULT_INTRAY)
+    parser.add_argument("--intray", type=Path, default=None)
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     args = parser.parse_args(argv)
+    args.intray = args.intray or intray_dir(args.config)
     snap = snapshot(args.relay_db, args.a2a_db, args.intray, retired_jobs(args.config))
     args.out.write_text(render(snap, args.relay_db, args.a2a_db), encoding="utf-8")
     print(f"Wrote {args.out} - waiting on you: {len(snap.waiting)}")

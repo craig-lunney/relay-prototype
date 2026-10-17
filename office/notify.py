@@ -18,7 +18,7 @@ import sys
 from pathlib import Path
 from xml.sax.saxutils import escape
 
-from .jobs import DEFAULT_CONFIG, DEFAULT_INTRAY, JOBS, load_result, retired_jobs
+from .jobs import DEFAULT_CONFIG, intray_dir, JOBS, load_result, retired_jobs
 
 PROBLEM_STATUSES = ("ALERT", "ERROR")
 ON_DEMAND = frozenset({"share-preview"})  # one-off checks: never a morning alert
@@ -80,10 +80,11 @@ def show_toast(title: str, body: str, run=subprocess.run) -> bool:
 
 def main(argv: list[str] | None = None, run=subprocess.run) -> int:
     parser = argparse.ArgumentParser(prog="office.notify", description=__doc__.split("\n\n")[0])
-    parser.add_argument("--intray", type=Path, default=DEFAULT_INTRAY)
+    parser.add_argument("--intray", type=Path, default=None)
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     parser.add_argument("--test", action="store_true", help="show a test notification")
     args = parser.parse_args(argv)
+    args.intray = args.intray or intray_dir(args.config)
     if args.test:
         ok = show_toast("Agent Office", "Test notification: alerts will appear like this.", run)
         print("Test notification shown." if ok else "Could not show a notification.")
